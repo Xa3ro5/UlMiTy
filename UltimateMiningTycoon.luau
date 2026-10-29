@@ -1008,8 +1008,9 @@ local function getTerrainCells(terrain, valid)
     return cells
 end
 
-local function hasHigherPricedOre(terrain,target,valid)
+local function hasHigherPricedOre(terrain,target,valid,reachable)
     valid=valid or function() return true end
+    if not valid() or type(reachable)~="function" then return false end
     local strength,speed=pickaxeStrength(),MiningUtils.GetPlayerPickaxeSpeedClient()
     local now=os.clock()
     for _,entry in ipairs(getTerrainCells(terrain,valid)) do
@@ -1023,7 +1024,17 @@ local function hasHigherPricedOre(terrain,target,valid)
                 and not (def.Types and (def.Types.Terrain or def.Types.Boundary)) then
                 local expiry=state.failedTargets and state.failedTargets[tostring(pos)..":"..id]
                 local duration=MiningTime(speed,strength,def.Hardness)
-                if (not expiry or expiry<=now) and duration and duration<999 then return true end
+                if (not expiry or expiry<=now) and duration and duration<999 then
+                    -- Retry expiry only makes a target eligible for another probe.
+                    -- It must have a usable position before interrupting a mining hit.
+                    local candidate={pos=pos,world=worldAt(pos),id=id,def=def,
+                        value=tonumber(def.Value) or 0,isOre=true}
+                    local accessible=reachable(candidate)
+                    if not valid() then return false end
+                    if accessible then return true end
+                    state.failedTargets=state.failedTargets or {}
+                    state.failedTargets[tostring(pos)..":"..id]=os.clock()+4
+                end
             end
         end
     end
@@ -1102,6 +1113,9 @@ local function findMiningStand(terrain,target,root,range,strength,valid)
     local access
     for _,entry in ipairs(stands) do
         if not valid() then return end
+        -- Ore requests are accepted from an interior, in-range open stand even
+        -- when the center ray hits the host rock. Keep ray checks for stone.
+        if target.isOre then return entry.stand,false end
         if visibleFace(entry.stand,target.world) then return entry.stand,false end
         local delta=target.world-entry.stand
         local hit=WS:Raycast(entry.stand,delta.Unit*(delta.Magnitude+2),terrainRay)
@@ -1149,7 +1163,7 @@ local function chooseTarget(client, terrain, root, valid)
     for i,target in ipairs(candidates) do
         if not valid() then return end
         if target.distance<=range and insideMine(terrain,root.Position)
-            and visibleFace(root.Position,target.world) then return target,range end
+            and (target.isOre or visibleFace(root.Position,target.world)) then return target,range end
         local stand,access=findMiningStand(terrain,target,root,range,strength,valid)
         if stand then
             target.stand,target.needsAccess=stand,access
@@ -2138,7 +2152,15 @@ local function mineOnce()
         return
     end
 
-    if hasHigherPricedOre(terrain,target,valid) then
+    local function reachableHigher(candidate)
+        if not valid() or not pickTool.Equipped or pickTool.Model.Parent~=char then return false end
+        if (root.Position-candidate.world).Magnitude<=range
+            and insideMine(terrain,root.Position)
+            and (candidate.isOre or visibleFace(root.Position,candidate.world)) then return true end
+        return findMiningStand(terrain,candidate,root,range,pickaxeStrength(),valid)~=nil
+    end
+
+    if hasHigherPricedOre(terrain,target,valid,reachableHigher) then
         return
     end
 
@@ -2184,7 +2206,7 @@ local function mineOnce()
         return
     end
 
-    if not visibleFace(root.Position,target.world) then
+    if not target.isOre and not visibleFace(root.Position,target.world) then
         local exposed,cleared=clearOreAccess(terrain,target,client,pickTool,range,targetValidCheap)
         if not valid() then return end
         if not exposed then
@@ -2216,16 +2238,22 @@ local function mineOnce()
 
         local finish=os.clock()+math.max(0.05,duration)
         local nextPriorityCheck=os.clock()+0.5
+        local nextStatusUpdate=0
         while os.clock()<finish do
             if not targetValidCheap() then
                 return
             end
             if os.clock()>=nextPriorityCheck then
-                if hasHigherPricedOre(terrain,target,valid) then
+                if hasHigherPricedOre(terrain,target,valid,reachableHigher) then
                     state.status="Higher-priced ore appeared; selecting again"
                     return
                 end
                 nextPriorityCheck=os.clock()+0.5
+            end
+            if os.clock()>=nextStatusUpdate then
+                state.status=("Mining: %s | %.1fs remaining | hit %d"):format(
+                    state.currentOre,math.max(0,finish-os.clock()),attempts)
+                nextStatusUpdate=os.clock()+0.2
             end
             task.wait(0.02)
         end
