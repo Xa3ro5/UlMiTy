@@ -40,6 +40,7 @@ local state = {
     status = "Ready", currentOre = nil,
     nextSell = 0, manualSell = false, mineGeneration = 0,
     nextVehicleSell = 0,
+    pendingAction = old and old.pendingAction or nil,
     cellsCache = nil, cellsCacheTime = 0,
     openPosCache = {},
     cfg = {
@@ -177,6 +178,7 @@ local function updateFlyDirection(keyCode, begin)
 end
 
 local function flyTeleport(cf, token)
+    if state.Legit and state.Legit.enabled then return false,"Disable Legit before teleporting" end
     if token and token ~= state.cancelVersion then return false, "Cancelled" end
     local char, root, humanoid = characterRoot()
     if not root then return false, "Character unavailable" end
@@ -209,7 +211,8 @@ table.insert(state.connections, UserInputService.InputEnded:Connect(function(inp
 end))
 
 table.insert(state.connections, RunService.Heartbeat:Connect(function(dt)
-    if not alive() or not state.flyEnabled or state.explosionReset then return end
+    if not alive() or not state.flyEnabled or state.explosionReset
+        or (state.Legit and state.Legit.enabled) then return end
     if state.isDriving and state.isDriving() then return end
     local _, root, humanoid = characterRoot()
     if not root or not humanoid or humanoid.Health <= 0 then return end
@@ -241,6 +244,7 @@ end))
 
 table.insert(state.connections, mouse.Button1Down:Connect(function()
     if not alive() or state.explosionReset then return end
+    if state.Legit and state.Legit.enabled then return end
     if not UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then return end
     if not mouse.Target then return end
 
@@ -271,8 +275,12 @@ table.insert(state.connections, lp.CharacterAdded:Connect(function()
     if state.flyEnabled then resetFlyCoordinate() end
     local _, _, humanoid = characterRoot()
     if humanoid then
-        humanoid.WalkSpeed = state.walkSpeed
-        humanoid.JumpPower = state.jumpHeight
+        if state.Legit and state.Legit.enabled then
+            state.walkSpeed,state.jumpHeight=humanoid.WalkSpeed,humanoid.JumpPower
+        else
+            humanoid.WalkSpeed = state.walkSpeed
+            humanoid.JumpPower = state.jumpHeight
+        end
     end
     state.openPosCache = {}
     state.cellsCache = nil
@@ -284,6 +292,7 @@ end
 state.releaseAutoDrive = releaseAutoDrive
 
 function state.Stop()
+    if state.Legit then state.Legit.SetEnabled(false) state.Legit.Release() end
     state.SetNoclip(false)
     state.SetExplosionCooldownBypass(false)
     if state.CancelExplosionReset then state.CancelExplosionReset() end
@@ -557,23 +566,23 @@ end
 
 local function cancelAction()
     local pending = state.pendingAction
-    state.pendingAction = nil
     if not pending then return end
-    if pending.promise and type(pending.promise.cancel) == "function" then
-        pcall(function() pending.promise:cancel() end)
-    end
-    if pending.thread and coroutine.status(pending.thread) ~= "dead" then
-        pcall(task.cancel, pending.thread)
-    end
+    -- Cancelling a local coroutine/Promise cannot recall an InvokeServer.
+    -- Retain its slot until the original response settles, including reload.
+    pending.abandoned=true
+    if pending.done then state.pendingAction=nil end
 end
 state.cancelAction = cancelAction
 
 local function performAction(factory, valid)
+    if state.pendingAction and state.pendingAction.done then state.pendingAction=nil end
     if state.pendingAction then return false, "Action already pending" end
+    if not valid() then return false,"Cancelled" end
     local pending = {started=os.clock()}
     state.pendingAction = pending
     pending.thread = task.spawn(function()
         local ok, result = pcall(function()
+            if not valid() then return false end
             local p = factory()
             if type(p) == "table" and type(p.await) == "function" then
                 pending.promise = p
@@ -585,6 +594,7 @@ local function performAction(factory, valid)
             return p
         end)
         pending.ok, pending.result, pending.done = ok, result, true
+        if pending.abandoned and state.pendingAction==pending then state.pendingAction=nil end
     end)
     while not pending.done and valid() and os.clock()-pending.started < state.cfg.ActionTimeout do
         task.wait(0.03)
@@ -706,6 +716,10 @@ local function unloadBackpack(valid)
 end
 
 local function sellCargo(kind, manual)
+    if state.Legit and state.Legit.enabled then
+        state.status="Legit: use automatic physical backpack unloading or disable Legit"
+        return false
+    end
     if state.busy then return false end
     local count
     if kind == "Vehicle" then count=vehicleCargoStatus() else count=cargoStatus() end
@@ -2319,6 +2333,1093 @@ local function mineOnce()
 end
 
 ----------------------------------------------------------------
+-- LEGIT: physical routes and native-speed, visible pickaxe hits
+----------------------------------------------------------------
+do
+    local PathfindingService=game:GetService("PathfindingService")
+    local L={enabled=false,excluded={},regions={},phase="Off",confirmed=0,skipped=0,
+        delivery=old and old.Legit and old.Legit.delivery or nil,
+        transfers=0,deliveries=0,confirmedValue=0,
+        cfg={Radius=3000,SkipSeconds=90,ClusterRadius=8,TryVehicle=true,WalkRadius=160,DigAccess=true}}
+    state.Legit=L
+
+    local function flat(v) return Vector3.new(v.X,0,v.Z) end
+    local function currentVehicle(v)
+        return v and getOwnedVehicle()==v and v.Model and v.Model.Parent and v.Model.PrimaryPart
+    end
+    local function sameCell(terrain,t)
+        local c=terrain:Get(t.pos)
+        return c and (c.Ore==t.id or (t.isAccess and not c.Ore and c.Block==t.id))
+    end
+    function L.ClearSkipped()
+        L.excluded,L.regions={},{}
+    end
+    function L.IsSkipped(t,now)
+        now=now or os.clock()
+        local key=targetKey(t)
+        if (L.excluded[key] or 0)>now then return true end
+        L.excluded[key]=nil
+        for i=#L.regions,1,-1 do
+            local r=L.regions[i]
+            if r.expires<=now then table.remove(L.regions,i)
+            elseif r.id==t.id and (t.world-r.world).Magnitude<=L.cfg.ClusterRadius
+                and t.world.Y>=r.world.Y-4 then return true end
+        end
+        return false
+    end
+    function L.Skip(t,cluster,reason)
+        local expiry=os.clock()+L.cfg.SkipSeconds
+        L.excluded[targetKey(t)]=expiry
+        if cluster then
+            L.regions[#L.regions+1]={id=t.id,world=t.world,expires=expiry}
+            if #L.regions>64 then table.remove(L.regions,1) end
+        end
+        L.skipped+=1
+        L.lastSkip=reason
+        state.status="Legit: "..reason.."; trying another ore"
+    end
+
+    -- Own only native input and this exact character. Legit never writes
+    -- position, CFrame, velocity, collision or anchoring on character/vehicle.
+    function L.Release()
+        local motion=L.motion
+        L.motion=nil
+        if motion then
+            if motion.vehicle then
+                local v=motion.vehicle
+                if v.DriverStep==motion.wrapper then
+                    v.DriverStep=motion.ownStep
+                    pcall(brakeVehicle,v)
+                    pcall(function() v:HandbrakeInput(false) end)
+                end
+            elseif motion.root and motion.root.Parent and motion.humanoid.Parent then
+                motion.humanoid:MoveTo(motion.root.Position)
+                motion.humanoid:Move(Vector3.zero)
+            end
+            if motion.controls and motion.restoreControls and motion.controls.controlsEnabled==false then
+                motion.controls:Enable()
+            end
+        end
+        if L.swing then
+            pcall(function() L.swing:Stop() end)
+            L.swing=nil
+        end
+        if L.path then L.path:Destroy() L.path=nil end
+    end
+
+    function L.SetEnabled(on)
+        on=on==true and alive()
+        if on and not state.uiReady then return end
+        if on==L.enabled then return end
+        L.enabled=on
+        state.cancelVersion+=1
+        L.Release()
+        cancelAction()
+        L.target=nil
+        L.accessTarget=nil
+        L.nextWork=0
+        if on then
+            state.running=false
+            state.cfg.AutoDriveForward=false
+            state.cfg.AutoSell=false
+            state.cfg.AutoEquip=true
+            state.manualSell=false
+            releaseAutoDrive()
+            state.SetExplosionCooldownBypass(false)
+            if state.CancelExplosionReset then state.CancelExplosionReset() end
+            state.SetNoclip(false)
+            state.flyEnabled=false
+            state.flyCoordinate=nil
+            state.ctrlClickTP,state.ctrlDelete=false,false
+            for _,name in ipairs({"mineToggle","autoDriveToggle","autoSellToggle","flyToggle",
+                "noclipToggle","explosionCooldownToggle","ctrlClickToggle","ctrlDeleteToggle"}) do
+                if state[name] then state[name]:Set(false) end
+            end
+            local _,_,h=characterRoot()
+            if h then
+                local defaults=game:GetService("StarterPlayer")
+                h.WalkSpeed=math.min(h.WalkSpeed,defaults.CharacterWalkSpeed)
+                if h.UseJumpPower then h.JumpPower=math.min(h.JumpPower,defaults.CharacterJumpPower)
+                else h.JumpHeight=math.min(h.JumpHeight,defaults.CharacterJumpHeight) end
+                state.walkSpeed,state.jumpHeight=h.WalkSpeed,h.JumpPower
+            end
+            invalidateMining()
+            L.ClearSkipped()
+        end
+        L.phase=on and "Searching" or "Off"
+        state.status=on and "Legit: looking for affordable ore" or "Legit stopped"
+        if state.legitToggle then state.legitToggle:Set(on) end
+    end
+
+    local function params(vehicle,includeVehicle)
+        local p=RaycastParams.new()
+        p.FilterType=Enum.RaycastFilterType.Exclude
+        p.FilterDescendantsInstances=includeVehicle and {lp.Character} or {lp.Character,vehicle and vehicle.Model}
+        p.RespectCanCollide=true
+        return p
+    end
+    local function floorAt(world,vehicle,rise,drop)
+        local hit=WS:Raycast(world+Vector3.new(0,rise or 12,0),
+            Vector3.new(0,-(drop or 90),0),params(vehicle))
+        if hit and hit.Normal.Y>=0.65 then return hit.Position end
+    end
+    local function route(start,goal,vehicle,valid)
+        if not valid() then return nil,"Cancelled" end
+        local radius,height=2,5
+        if vehicle then
+            local _,size=vehicle.Model:GetBoundingBox()
+            radius,height=math.max(3,size.Z/2+0.5),math.max(5,size.Y)
+        end
+        local path=PathfindingService:CreatePath({AgentRadius=radius,AgentHeight=height,
+            AgentCanJump=vehicle==nil,WaypointSpacing=vehicle and 8 or 4,Costs={Water=math.huge}})
+        L.path=path
+        local result={}
+        -- ComputeAsync cannot be cancelled. Keep one slot until it settles;
+        -- a late path never starts movement for a cancelled generation.
+        if L.computing then path:Destroy() L.path=nil return nil,"Path computation pending" end
+        L.computing=result
+        task.spawn(function()
+            result.ok,result.error=pcall(function() path:ComputeAsync(start,goal) end)
+            result.done=true
+            if L.computing==result then L.computing=nil end
+        end)
+        local deadline=os.clock()+5
+        while valid() and not result.done and os.clock()<deadline do task.wait(0.05) end
+        local waypoints
+        if valid() and result.done and result.ok and path.Status==Enum.PathStatus.Success then
+            waypoints=path:GetWaypoints()
+        end
+        if L.path==path then L.path=nil end
+        path:Destroy()
+        if not waypoints or #waypoints==0 then return nil,"No physical path" end
+        if vehicle then
+            for _,w in ipairs(waypoints) do
+                if w.Action==Enum.PathWaypointAction.Jump then return nil,"Vehicle route needs a jump" end
+            end
+        end
+        return waypoints
+    end
+
+    local function walkSegment(goal,valid,seconds,jump)
+        local char,root,h=characterRoot()
+        if not root or state.isDriving() or not valid() then return false,"Cannot walk now" end
+        local points,why=route(root.Position,goal,nil,valid)
+        if not points then return false,why end
+        if not valid() then return false,"Cancelled" end
+        local controls=require(lp.PlayerScripts.PlayerModule):GetControls()
+        local motion={root=root,humanoid=h,controls=controls,restoreControls=controls.controlsEnabled==true}
+        L.motion=motion
+        if motion.restoreControls then controls:Disable() end
+        local deadline=os.clock()+(seconds or 18)
+        local ok=true
+        for _,w in ipairs(points) do
+            if not valid() then ok=false break end
+            if w.Action==Enum.PathWaypointAction.Jump or jump then h.Jump=true end
+            h:MoveTo(w.Position)
+            local best,stalled=math.huge,os.clock()
+            while valid() and os.clock()<deadline do
+                local distance=(root.Position-w.Position).Magnitude
+                -- Waypoints lie on the floor, the root is above it.
+                if flat(root.Position-w.Position).Magnitude<2 and math.abs(root.Position.Y-w.Position.Y)<5 then break end
+                if distance<best-0.3 then best,stalled=distance,os.clock() end
+                if os.clock()-stalled>2.5 then ok=false break end
+                task.wait(0.05)
+            end
+            if not ok or not valid() or os.clock()>=deadline then ok=false break end
+        end
+        if L.motion==motion then L.Release() end
+        local reached=ok and valid() and flat(root.Position-goal).Magnitude<3
+            and math.abs(root.Position.Y-goal.Y)<5
+        return reached,not reached and "Walking route blocked" or nil
+    end
+    local function walk(goal,valid,seconds,jump)
+        local _,root,h=characterRoot()
+        if not root or not valid() then return false,"Cancelled" end
+        local distance=flat(root.Position-goal).Magnitude
+        if distance<=200 then return walkSegment(goal,valid,seconds,jump) end
+        local deadline=os.clock()+math.min(600,math.max(seconds or 18,distance/math.max(4,h.WalkSpeed*0.65)+20))
+        while valid() and os.clock()<deadline do
+            local start=root.Position
+            local delta=flat(goal-start)
+            if delta.Magnitude<=200 then return walkSegment(goal,valid,math.max(seconds or 18,delta.Magnitude/math.max(4,h.WalkSpeed)+12),jump) end
+            local forward=delta.Unit
+            local side=Vector3.new(-forward.Z,0,forward.X)
+            local progressed=false
+            for _,angle in ipairs({0,0.35,-0.35}) do
+                if not valid() then return false,"Cancelled" end
+                local point=start+(forward*math.cos(angle)+side*math.sin(angle))*160
+                local y=start.Y+(goal.Y-start.Y)*math.min(1,160/delta.Magnitude)
+                local ground=floorAt(Vector3.new(point.X,y,point.Z),getOwnedVehicle(),24,140)
+                if ground and flat(ground-goal).Magnitude<delta.Magnitude-40 then
+                    local reached=walkSegment(ground,valid,math.max(seconds or 18,160/math.max(4,h.WalkSpeed)+12),jump)
+                    if reached or flat(root.Position-start).Magnitude>15 then progressed=true break end
+                    if L.computing then return false,"Path computation pending" end
+                end
+            end
+            if not progressed then return false,"Walking route blocked" end
+        end
+        return false,valid() and "Walking journey timed out" or "Cancelled"
+    end
+    L.Walk=walk
+
+    local function promptAt(prompt,action,vehicle,valid)
+        if not valid() or not prompt or not prompt.Parent or not prompt.Enabled
+            or prompt.ActionText~=action then
+            L.promptError=not valid() and "Cancelled" or ("Prompt: "..tostring(prompt and prompt.ActionText)..", enabled="..tostring(prompt and prompt.Enabled))
+            return false
+        end
+        local cf=pointOf(prompt.Parent)
+        local _,root=characterRoot()
+        if not cf or not root or (root.Position-cf.Position).Magnitude>prompt.MaxActivationDistance-0.5 then
+            L.promptError="Prompt distance: "..tostring(cf and root and (root.Position-cf.Position).Magnitude)
+            return false
+        end
+        -- Use exactly one trigger mechanism. InputHoldBegin/End followed by
+        -- fireproximityprompt can transfer twice and reverse an Add into Take.
+        local helper=typeof(fireproximityprompt)=="function"
+        if not helper then prompt:InputHoldBegin() end
+        local held=waitUntil(prompt.HoldDuration+0.15,valid)
+        if not helper then pcall(function() prompt:InputHoldEnd() end)
+        elseif held and valid() and prompt.Enabled and prompt.ActionText==action
+            and (root.Position-cf.Position).Magnitude<=prompt.MaxActivationDistance-0.5 then
+            fireproximityprompt(prompt)
+        else held=false end
+        L.promptError=not held and "Prompt hold cancelled" or nil
+        return held and valid() and currentVehicle(vehicle)~=nil
+    end
+    local function board(vehicle,valid)
+        if not currentVehicle(vehicle) or not valid() then return false end
+        if state.isDriving() then return VehicleController.CurrentDrivenVehicle==vehicle end
+        local seat=vehicle.DriversSeat
+        local prompt=seat and seat:FindFirstChildWhichIsA("ProximityPrompt",true)
+        if not prompt then return false end
+        local _,root=characterRoot()
+        local cf=pointOf(prompt.Parent)
+        if not root or not cf then return false end
+        if (root.Position-cf.Position).Magnitude>prompt.MaxActivationDistance-1 then
+            -- Approach either side, rather than pathfinding into the solid car.
+            local reached=false
+            for _,side in ipairs({1,-1}) do
+                if not valid() then return false end
+                local goal=floorAt(seat.Position+seat.CFrame.RightVector*side*5,vehicle,4,30)
+                if goal and walk(goal,valid,25) then reached=true break end
+            end
+            if not reached then return false end
+        end
+        for _=1,2 do
+            if not valid() then return false end
+            promptAt(prompt,"Drive",vehicle,valid)
+            if not waitUntil(0.4,valid) then return false end
+            if VehicleController.CurrentDrivenVehicle==vehicle and state.isDriving() then return true end
+        end
+        return false
+    end
+
+    function L.Steering(cf,goal,speed)
+        local delta=flat(goal-cf.Position)
+        if delta.Magnitude<0.01 then return 0,0,true end
+        local forward=flat(cf.RightVector).Unit -- Verified InnoVehicles forward axis.
+        local desired=delta.Unit
+        local dot=forward:Dot(desired)
+        local steer=math.clamp(forward:Cross(desired).Y*2.5,-1,1)
+        -- A bounded reverse turn handles a waypoint behind the vehicle.
+        local reverse=dot< -0.25
+        if reverse then steer=-steer end
+        if math.abs(steer)<0.05 and dot<0 then steer=1 end
+        local limit=reverse and 8 or math.clamp(38-math.abs(steer)*26,12,38)
+        local throttle=math.abs(speed)<limit and (reverse and 0.4 or 1) or 0
+        return steer,throttle,false,reverse
+    end
+    local function driveSegment(vehicle,goal,valid)
+        if not board(vehicle,valid) then return false,"Driver seat unreachable" end
+        if not valid() then return false,"Cancelled" end
+        local part=vehicle.Model.PrimaryPart
+        if flat(part.Position-goal).Magnitude<8 and math.abs(part.Position.Y-goal.Y)<12 then return true end
+        local start=floorAt(part.Position,vehicle,0,30)
+        if not start then return false,"Vehicle has no ground" end
+        local points,why
+        local _,size=vehicle.Model:GetBoundingBox()
+        -- The car itself occupies its navmesh start. Begin at a physically
+        -- clear point just beyond its footprint, without changing collisions.
+        for _,sign in ipairs({1,-1}) do
+            if not valid() then return false,"Cancelled" end
+            local offset=part.CFrame.RightVector*sign*(size.X/2+size.Z/2+3)
+            local first=floorAt(part.Position+offset,vehicle,2,25)
+            local clear=not WS:Raycast(part.Position+Vector3.new(0,1,0),offset,params(vehicle))
+            if first and clear and math.abs(first.Y-start.Y)<5 then
+                points,why=route(first,goal,vehicle,valid)
+                if points then break end
+            end
+        end
+        if not points then return false,why or "Vehicle exit path blocked" end
+        local motion={vehicle=vehicle,ownStep=rawget(vehicle,"DriverStep"),originalStep=vehicle.DriverStep,
+            throttle=0,steer=0,reverse=false,go=false}
+        motion.wrapper=function(self,dt)
+            if L.motion==motion and valid() and VehicleController.CurrentDrivenVehicle==vehicle then
+                self:ForwardInput(motion.go and not motion.reverse and motion.throttle or 0)
+                self:BackwardInput(motion.go and motion.reverse and motion.throttle or 0)
+                self:LeftInput(motion.go and math.max(0,motion.steer) or 0)
+                self:RightInput(motion.go and math.max(0,-motion.steer) or 0)
+                self:HandbrakeInput(not motion.go)
+            else brakeVehicle(self) end
+            return motion.originalStep(self,dt)
+        end
+        L.motion=motion
+        vehicle.DriverStep=motion.wrapper
+        local deadline=os.clock()+math.clamp((start-goal).Magnitude/8+20,20,480)
+        local index=1
+        local best,stalled=math.huge,os.clock()
+        local ok=false
+        while valid() and os.clock()<deadline do
+            if VehicleController.CurrentDrivenVehicle~=vehicle or not state.isDriving() then break end
+            if flat(part.Position-goal).Magnitude<6 and math.abs(part.Position.Y-goal.Y)<12 then ok=true break end
+            local w=points[index]
+            if not w then break end
+            local distance=flat(part.Position-w.Position).Magnitude
+            local tolerance=index==#points and 5 or 8
+            if distance<tolerance and math.abs(part.Position.Y-w.Position.Y)<12 then
+                index+=1 best,stalled=math.huge,os.clock()
+            else
+                if distance<best-0.4 then best,stalled=distance,os.clock() end
+                if os.clock()-stalled>6 then break end
+                local steer,throttle,_,reverse=L.Steering(part.CFrame,w.Position,part.AssemblyLinearVelocity.Magnitude)
+                motion.steer,motion.throttle,motion.reverse,motion.go=steer,throttle,reverse,true
+            end
+            task.wait(0.05)
+        end
+        motion.go=false
+        if L.motion==motion then
+            pcall(brakeVehicle,vehicle)
+            waitUntil(0.35,valid)
+            L.Release()
+        end
+        local reached=ok and valid()
+        return reached,not reached and "Vehicle path blocked or stalled" or nil
+    end
+    local function driveTo(vehicle,goal,valid)
+        if not valid() or not currentVehicle(vehicle) then return false,"Cancelled" end
+        local deadline=os.clock()+math.clamp((vehicle.Model.PrimaryPart.Position-goal).Magnitude/7+30,30,600)
+        local legs=0
+        while valid() and os.clock()<deadline and legs<32 do
+            local position=vehicle.Model.PrimaryPart.Position
+            local delta=flat(goal-position)
+            if delta.Magnitude<=320 then return driveSegment(vehicle,goal,valid) end
+            L.phase=L.delivery and "Driving delivery route" or L.phase
+            local forward=delta.Unit
+            local side=Vector3.new(-forward.Z,0,forward.X)
+            local progressed=false
+            -- Large navmesh searches can exhaust their node budget on an open
+            -- road too. Plan short, supported legs; detour left/right if needed.
+            for _,angle in ipairs({0,0.35,-0.35,0.7,-0.7}) do
+                if not valid() then return false,"Cancelled" end
+                local point=position+(forward*math.cos(angle)+side*math.sin(angle))*280
+                local y=position.Y+(goal.Y-position.Y)*math.min(1,280/delta.Magnitude)
+                local ground=floorAt(Vector3.new(point.X,y,point.Z),vehicle,24,140)
+                if ground and flat(ground-goal).Magnitude<delta.Magnitude-80 then
+                    local reached=driveSegment(vehicle,ground,valid)
+                    if reached then progressed=true break end
+                    if L.computing then return false,"Path computation pending" end
+                    if flat(vehicle.Model.PrimaryPart.Position-position).Magnitude>40 then progressed=true break end
+                end
+            end
+            if not progressed then return false,"Vehicle route segment blocked" end
+            legs+=1
+        end
+        return false,valid() and "Vehicle journey timed out" or "Cancelled"
+    end
+    L.DriveTo=driveTo
+
+    -- Sample real floor around the ore at the car's local floor level.
+    -- This avoids driving onto a wall-top above an unreachable ceiling ore.
+    local function parking(t,vehicle)
+        local part=vehicle.Model.PrimaryPart
+        local base=floorAt(part.Position,vehicle,0,35)
+        if not base then return {} end
+        local _,size=vehicle.Model:GetBoundingBox()
+        local distance=math.max(8,size.Z/2+5)
+        local points={}
+        for i=0,7 do
+            local angle=i*math.pi/4
+            for _,offset in ipairs({distance,distance+7}) do
+                -- The mine ramp rises when travelling toward its entrance.
+                -- Casting only from the car's old Y starts below uphill floor.
+                local y=math.max(base.Y,t.world.Y+4)
+                local world=Vector3.new(t.world.X,y,t.world.Z)+Vector3.new(math.cos(angle)*offset,0,math.sin(angle)*offset)
+                local floor=floorAt(world,vehicle,8,math.max(55,y-base.Y+40))
+                if floor and math.abs(floor.Y-t.world.Y)<=math.max(18,L.range or 12) then points[#points+1]=floor end
+            end
+        end
+        table.sort(points,function(a,b) return (a-part.Position).Magnitude<(b-part.Position).Magnitude end)
+        return points
+    end
+    L.Parking=parking
+
+    local function visible(t,root,vehicle,range)
+        if (root.Position-t.world).Magnitude>range then return false end
+        -- Check a small set of points on the cell; an adjacent stone never
+        -- counts as the requested ore. No through-wall ore requests.
+        for _,offset in ipairs({Vector3.zero,Vector3.new(0,1.4,0),Vector3.new(0,-1.4,0),
+            Vector3.new(1.4,0,0),Vector3.new(-1.4,0,0),Vector3.new(0,0,1.4),Vector3.new(0,0,-1.4)}) do
+            local delta=t.world+offset-root.Position
+            local hit=WS:Raycast(root.Position,delta.Unit*(delta.Magnitude+2),params(vehicle,true))
+            if hit and hit.Instance==WS.Terrain then
+                local c=cellAt(hit.Position-hit.Normal*0.1)
+                if c==t.pos then return true end
+            end
+        end
+        return false
+    end
+    L.Visible=visible
+
+    local function hitOre(t,terrain,vehicle,valid)
+        if not valid() or not sameCell(terrain,t) then return false,"Target changed" end
+        local client,tool=pickaxeClient()
+        if not valid() or not client or not tool then return false,"Pickaxe unavailable" end
+        local char,root=characterRoot()
+        local range=tonumber(client.Tool.Definition.Stats.Range) or 12
+        local function ready()
+            local count,capacity=cargoStatus()
+            return valid() and lp.Character==char and not state.isDriving() and tool.Equipped
+                and tool.Model.Parent==char and count~=nil and capacity~=nil and count<capacity
+                and pickaxeStrength()>=t.def.Hardness and sameCell(terrain,t) and visible(t,root,vehicle,range)
+        end
+        if not ready() then return false,"Ore out of physical reach" end
+        local duration=MiningTime(MiningUtils.GetPlayerPickaxeSpeedClient(),pickaxeStrength(),t.def.Hardness)
+        if not duration or duration>=999 or t.def.Hardness>pickaxeStrength() then return false,"Pickaxe too weak" end
+        L.swing=client.SwingAnimTrack
+        if L.swing then L.swing:Play(nil,nil,2.4) end
+        local finish=os.clock()+math.max(0.05,duration)
+        local nextPriority=os.clock()+0.8
+        local preempted=false
+        while ready() and os.clock()<finish do
+            if not t.isAccess and os.clock()>=nextPriority then
+                local better=L.Select(terrain,root,valid)
+                if better and better.value>(tonumber(t.def.Value) or 0)
+                    and visible(better,root,vehicle,range) then preempted=true break end
+                nextPriority=os.clock()+0.8
+            end
+            state.status=("Legit: mining %s | %.1fs"):format(t.id,math.max(0,finish-os.clock()))
+            task.wait(0.05)
+        end
+        local accepted,why=false,"Lost physical reach"
+        if not preempted and ready() then
+            accepted,why=mineConfirmed(client,terrain,t.pos,function()
+                -- Replication may replace the cell with Air before the RPC
+                -- resolves. Retain physical ownership, not the old cell here.
+                return valid() and lp.Character==char and not state.isDriving()
+                    and tool.Equipped and tool.Model.Parent==char
+                    and (root.Position-t.world).Magnitude<=range
+            end)
+        end
+        if L.swing then L.swing:Stop() L.swing=nil end
+        if preempted then return false,"Higher-priced ore available" end
+        if accepted then
+            if t.isAccess and not t.isOre then
+                state.accessBlocks=(state.accessBlocks or 0)+1
+            else
+                L.confirmed+=1
+                L.confirmedValue+=(tonumber(t.def.Value) or 0)
+                state.minedBlocks=(state.minedBlocks or 0)+1
+            end
+            state.lastProgress=os.clock()
+            L.lastResult=t.id.." (server confirmed)"
+            state.status="Legit: mined "..L.lastResult
+        end
+        return accepted,why
+    end
+    L.HitOre=hitOre
+
+    -- Dig only the actual obstruction or the next standing volume, never a
+    -- radius of arbitrary stone. One accepted block at a time, then replan.
+    function L.AccessBlock(terrain,pos,root,range)
+        local cell=terrain:Get(pos)
+        local id=cell and (cell.Ore or cell.Block)
+        local def=id and BlockDefinitions[id]
+        if not def or id=="Air" or not def.Hardness or def.Hardness>pickaxeStrength()
+            or def.ExplosiveOnly or (def.Types and def.Types.Boundary)
+            or not (cell.Ore or (def.Types and def.Types.Stone)) then return end
+        local world=worldAt(pos)
+        if (root.Position-world).Magnitude>range then return end
+        return {pos=pos,world=world,id=id,def=def,isAccess=true,isOre=cell.Ore~=nil,value=tonumber(def.Value) or 0}
+    end
+
+    local function walkingClear(stand,terrain,vehicle)
+        local _,root=characterRoot()
+        for _,lift in ipairs({0,2}) do
+            local cell=terrain:Get(cellAt(stand+Vector3.new(0,lift,0)))
+            if not cell or cell.Block~="Air" or cell.Ore then return false end
+        end
+        local delta=stand-root.Position
+        return delta.Magnitude<0.05 or not WS:Blockcast(CFrame.new(root.Position+Vector3.new(0,0.5,0)),
+            Vector3.new(2.4,4,2.4),delta,params(vehicle))
+    end
+    local function directStep(goal,terrain,vehicle,valid)
+        local _,root,h=characterRoot()
+        local stand=goal+Vector3.new(0,h.HipHeight+root.Size.Y/2+0.15,0)
+        if not valid() or not walkingClear(stand,terrain,vehicle) then return false end
+        local controls=require(lp.PlayerScripts.PlayerModule):GetControls()
+        local motion={root=root,humanoid=h,controls=controls,restoreControls=controls.controlsEnabled==true}
+        L.motion=motion
+        if motion.restoreControls then controls:Disable() end
+        h:MoveTo(goal)
+        local deadline=os.clock()+2
+        while valid() and os.clock()<deadline and flat(root.Position-goal).Magnitude>1.5 do task.wait(0.05) end
+        if L.motion==motion then L.Release() end
+        return valid() and flat(root.Position-goal).Magnitude<=1.5 and math.abs(root.Position.Y-goal.Y)<5
+    end
+
+    local function accessAttempt(t,terrain,vehicle,valid)
+        if not L.cfg.DigAccess then return false,"Access digging disabled" end
+        L.phase="Digging access to "..t.id
+        local deadline,cleared=os.clock()+20,0
+        while valid() and sameCell(terrain,t) and os.clock()<deadline and cleared<10 do
+            local count,capacity=cargoStatus()
+            if not count or not capacity then return false,"Cargo state unavailable" end
+            if count>=capacity then return false,"Backpack full" end
+            local _,root,h=characterRoot()
+            if visible(t,root,vehicle,L.range) then return hitOre(t,terrain,vehicle,valid) end
+            local delta=t.world-root.Position
+            local horizontal=flat(delta)
+            local obstruction
+            if delta.Magnitude>0.01 then
+                local hit=WS:Raycast(root.Position,delta.Unit*math.min(delta.Magnitude+2,L.range),params(vehicle,true))
+                if hit and hit.Instance==WS.Terrain then
+                    obstruction=L.AccessBlock(terrain,cellAt(hit.Position-hit.Normal*0.1),root,L.range)
+                end
+            end
+            -- A real, supported next step. Never remove the floor below the
+            -- player or walk into unknown cells / a shaft to reach an ore.
+            if horizontal.Magnitude>3 then
+                local nextPoint=root.Position+horizontal.Unit*3.5
+                local feet=root.Position.Y-h.HipHeight-root.Size.Y/2
+                -- Clear a standing-height corridor even when the next ray
+                -- starts inside a wall and cannot find its floor yet.
+                local low=cellAt(nextPoint-Vector3.new(1.1,h.HipHeight+root.Size.Y/2-0.5,1.1))
+                local high=cellAt(nextPoint+Vector3.new(1.1,2.6,1.1))
+                local bodyBlock
+                for x=low.X,high.X do for y=low.Y,high.Y do for z=low.Z,high.Z do
+                    local block=L.AccessBlock(terrain,Vector3int16.new(x,y,z),root,L.range)
+                    if block and block.world.Y>feet+0.5 and visible(block,root,vehicle,L.range)
+                        and (not bodyBlock or (block.world-root.Position).Magnitude<(bodyBlock.world-root.Position).Magnitude) then bodyBlock=block end
+                end end end
+                if bodyBlock then obstruction=bodyBlock end
+                local floor=floorAt(nextPoint,vehicle,1,10)
+                if floor and floor.Y>=feet-4 and floor.Y<=feet+2 then
+                    local stand=floor+Vector3.new(0,h.HipHeight+root.Size.Y/2+0.15,0)
+                    if walkingClear(stand,terrain,vehicle) then
+                        if directStep(floor,terrain,vehicle,valid) then continue end
+                    elseif not obstruction then
+                        local low=cellAt(stand-Vector3.new(1.1,h.HipHeight+root.Size.Y/2-0.1,1.1))
+                        local high=cellAt(stand+Vector3.new(1.1,2.6,1.1))
+                        for x=low.X,high.X do for y=low.Y,high.Y do for z=low.Z,high.Z do
+                            local block=L.AccessBlock(terrain,Vector3int16.new(x,y,z),root,L.range)
+                            if block and block.world.Y>feet+0.5 and visible(block,root,vehicle,L.range)
+                                and (not obstruction or (block.world-root.Position).Magnitude<(obstruction.world-root.Position).Magnitude) then obstruction=block end
+                        end end end
+                    end
+                end
+            end
+            if not obstruction or obstruction.pos==t.pos or obstruction.world.Y<root.Position.Y-h.HipHeight-root.Size.Y/2
+                or not visible(obstruction,root,vehicle,L.range) then
+                return false,cleared>0 and "Access progress" or "No mineable access route"
+            end
+            state.status="Legit: clearing "..obstruction.id.." for "..t.id
+            local accepted,why=hitOre(obstruction,terrain,vehicle,valid)
+            if not accepted then return false,why end
+            cleared+=1
+            if not waitUntil(0.12,valid) then return false,"Cancelled" end
+        end
+        return false,cleared>0 and "Access progress" or "No mineable access route"
+    end
+    L.AccessAttempt=accessAttempt
+
+    local function groundAttempt(t,terrain,vehicle,valid)
+        L.phase="Ground approach"
+        local _,root=characterRoot()
+        if visible(t,root,vehicle,L.range) then return hitOre(t,terrain,vehicle,valid) end
+        local goals={}
+        for i=0,7 do
+            local a=i*math.pi/4
+            local world=Vector3.new(t.world.X,t.world.Y+4,t.world.Z)+Vector3.new(math.cos(a)*6,0,math.sin(a)*6)
+            local floor=floorAt(world,vehicle,6,45)
+            if floor and (floor+Vector3.new(0,3,0)-t.world).Magnitude<=L.range then goals[#goals+1]=floor end
+        end
+        table.sort(goals,function(a,b) return (a-root.Position).Magnitude<(b-root.Position).Magnitude end)
+        for i=1,math.min(3,#goals) do
+            if not valid() then return false,"Cancelled" end
+            if walk(goals[i],valid,12) then
+                local ok,why=hitOre(t,terrain,vehicle,valid)
+                if ok then return true end
+                if why=="Pickaxe unavailable" or why=="Higher-priced ore available" then return false,why end
+            end
+        end
+        return false,"Ground reach failed"
+    end
+
+    local function roofAttempt(t,terrain,vehicle,valid)
+        L.phase="Climbing vehicle"
+        local _,root,h=characterRoot()
+        local model=vehicle.Model
+        local cf,size=model:GetBoundingBox()
+        local include=RaycastParams.new()
+        include.FilterType=Enum.RaycastFilterType.Include
+        include.FilterDescendantsInstances={model}
+        include.RespectCanCollide=true
+        local supports={}
+        -- Raycasts find actual collidable roofs/steps, not a model's empty box.
+        for _,x in ipairs({-0.3,0,0.3}) do
+            for _,z in ipairs({-0.25,0,0.25}) do
+                local origin=cf:PointToWorldSpace(Vector3.new(size.X*x,size.Y/2+4,size.Z*z))
+                local hit=WS:Raycast(origin,Vector3.new(0,-size.Y-8,0),include)
+                if hit and hit.Normal.Y>0.7 then supports[#supports+1]=hit.Position end
+            end
+        end
+        table.sort(supports,function(a,b) return a.Y<b.Y end)
+        local jumpHeight=h.UseJumpPower and h.JumpPower^2/(2*math.max(1,WS.Gravity)) or h.JumpHeight
+        for _,goal in ipairs(supports) do
+            if not valid() then return false,"Cancelled" end
+            local feet=root.Position.Y-h.HipHeight-root.Size.Y/2
+            if goal.Y-feet<=jumpHeight+0.5 and (goal+Vector3.new(0,3,0)-t.world).Magnitude<=L.range then
+                -- Native jump and MoveTo can climb surfaces omitted by navmesh.
+                local controls=require(lp.PlayerScripts.PlayerModule):GetControls()
+                local motion={root=root,humanoid=h,controls=controls,restoreControls=controls.controlsEnabled==true}
+                L.motion=motion
+                if motion.restoreControls then controls:Disable() end
+                h.Jump=true
+                h:MoveTo(goal+Vector3.new(0,h.HipHeight+root.Size.Y/2,0))
+                local deadline=os.clock()+2.5
+                local stood=false
+                while valid() and os.clock()<deadline do
+                    local under=WS:Raycast(root.Position,Vector3.new(0,-6,0),include)
+                    if under and h.FloorMaterial~=Enum.Material.Air and flat(root.Position-goal).Magnitude<3 then stood=true break end
+                    task.wait(0.05)
+                end
+                if L.motion==motion then L.Release() end
+                if stood and waitUntil(0.2,valid) then
+                    local ok,why=hitOre(t,terrain,vehicle,valid)
+                    if ok then return true end
+                    if why=="Pickaxe unavailable" or why=="Higher-priced ore available" then return false,why end
+                end
+            end
+        end
+        return false,"Ground and vehicle reach failed"
+    end
+
+    function L.Select(terrain,root,valid)
+        local strength,speed=pickaxeStrength(),MiningUtils.GetPlayerPickaxeSpeedClient()
+        local best
+        for _,entry in ipairs(getTerrainCells(terrain,valid)) do
+            if not valid() then return end
+            -- Unknown/generated cells are not exposed physical mining targets.
+            local cell=terrain:Get(entry.pos)
+            local id=cell and cell.Ore
+            local def=id and BlockDefinitions[id]
+            if def and def.Hardness and def.Hardness<=strength and not def.ExplosiveOnly
+                and not (def.Types and (def.Types.Terrain or def.Types.Boundary)) then
+                local world=worldAt(entry.pos)
+                local duration=MiningTime(speed,strength,def.Hardness)
+                local t={pos=entry.pos,world=world,id=id,def=def,value=tonumber(def.Value) or 0,
+                    distance=(root.Position-world).Magnitude}
+                if duration and duration<999 and t.distance<=L.cfg.Radius and not L.IsSkipped(t) then
+                    if not best or t.value>best.value or (t.value==best.value
+                        and (t.distance<best.distance or (t.distance==best.distance and targetKey(t)<targetKey(best)))) then
+                        best=t
+                    end
+                end
+            end
+        end
+        return best
+    end
+
+    -- A trip starts only with BOTH capacities full. Once started, finish the
+    -- entire batch (including a partial last shuttle) before returning to mine.
+    function L.CargoPlan(count,capacity,vc,vmax,delivery)
+        if not count or not capacity or capacity<=0 or not vc or not vmax or vmax<=0 then return "Unknown" end
+        if delivery then return delivery.phase=="Return" and "Return" or "Deliver" end
+        if count>=capacity then return vc>=vmax and "Deliver" or "Load vehicle" end
+        return "Mine"
+    end
+
+    local function approachPrompt(prompt,vehicle,valid)
+        if not valid() or not prompt or not prompt.Parent then return false end
+        local cf=pointOf(prompt.Parent)
+        local _,root=characterRoot()
+        if not cf or not root then return false end
+        local distance=math.max(0.5,prompt.MaxActivationDistance-0.8)
+        if (root.Position-cf.Position).Magnitude<=distance then return true end
+        local goals={}
+        for i=0,7 do
+            local a=i*math.pi/4
+            local offset=math.max(2,math.min(6,distance-2))
+            local near=floorAt(cf.Position+Vector3.new(math.cos(a)*offset,0,math.sin(a)*offset),vehicle,5,35)
+            if near and (near+Vector3.new(0,3,0)-cf.Position).Magnitude<=distance then goals[#goals+1]=near end
+        end
+        table.sort(goals,function(a,b) return (a-root.Position).Magnitude<(b-root.Position).Magnitude end)
+        for i=1,math.min(4,#goals) do
+            if not valid() then return false end
+            if walk(goals[i],valid,18) and (root.Position-cf.Position).Magnitude<=distance then return true end
+            if L.computing then return false end
+        end
+        return false
+    end
+
+    -- Count changes are read from replicated cargo serializations, never from
+    -- local CargoVolume:PullFrom/Pop or prompt dispatch alone.
+    local function transfer(vehicle,action,valid)
+        if not exitVehicle(valid) or not valid() then return false,"Cannot exit vehicle" end
+        local prompt=vehicleCargoPrompt(vehicle)
+        if not approachPrompt(prompt,vehicle,valid) then return false,"Vehicle cargo is out of reach" end
+        local count,capacity=cargoStatus()
+        local vc,vmax=vehicleCargoStatus()
+        if not count or not vc then return false,"Cargo state unavailable" end
+        local adding=action=="Add Items"
+        if adding and (count==0 or vc>=vmax) then return true end
+        if not adding and (vc==0 or count>=capacity) then return true end
+        local beforeCount,beforeVC=count,vc
+        -- One dispatch in flight. Do not retry an unconfirmed transfer and
+        -- accidentally reverse it when the prompt switches to Take Items.
+        if not promptAt(prompt,action,vehicle,valid) then return false,"Waiting for "..action.." prompt" end
+        local deadline=os.clock()+4
+        while valid() and os.clock()<deadline do
+            count,capacity=cargoStatus()
+            vc,vmax=vehicleCargoStatus()
+            if count and vc then
+                local moved=adding and beforeCount-count or count-beforeCount
+                local other=adding and vc-beforeVC or beforeVC-vc
+                if moved>0 and moved==other then
+                    if adding then L.transfers+=1 end
+                    L.lastResult=("%s: backpack %d -> %d, vehicle %d -> %d"):format(action,beforeCount,count,beforeVC,vc)
+                    return true
+                end
+            end
+            task.wait(0.05)
+        end
+        return false,"Cargo transfer not confirmed"
+    end
+    L.Transfer=transfer
+
+    local function unloadBackpackHere(vehicle,valid)
+        local prompt=unloaderPrompt()
+        if not approachPrompt(prompt,vehicle,valid) then return false,"Own unloader is out of reach" end
+        local count=cargoStatus()
+        if count==nil then return false,"Backpack state unavailable" end
+        local initial=count
+        local deadline,lastProgress=os.clock()+state.cfg.SellTimeout,os.clock()
+        while valid() and count>0 and os.clock()<deadline do
+            if os.clock()-lastProgress>5 then return false,"Unloader made no progress" end
+            local before=count
+            if prompt.ActionText~="Add Items" then
+                state.status="Legit: waiting for factory to make room in the unloader"
+                if not waitUntil(0.2,valid) then return false,"Cancelled" end
+                continue
+            end
+            if not promptAt(prompt,"Add Items",vehicle,valid) then return false,L.promptError or "Unloader prompt not ready" end
+            local untilTime=os.clock()+1
+            repeat
+                if not waitUntil(0.05,valid) then return false,"Cancelled" end
+                count=cargoStatus()
+            until count==nil or count<before or os.clock()>=untilTime
+            if count==nil then return false,"Backpack state unavailable" end
+            if count<before then lastProgress=os.clock() end
+        end
+        if valid() and count==0 then
+            if initial>0 then
+                state.sellCycles=(state.sellCycles or 0)+1
+                L.lastResult=("Backpack unloaded (%d -> 0)"):format(initial)
+            end
+            return true
+        end
+        return false,"Backpack unload timed out"
+    end
+
+    local function tripVia(vehicle)
+        local terrain=MineTerrain.GetInstance()
+        if not terrain or not terrain._MineOrigin then return end
+        local origin=worldAt(terrain._MineOrigin)
+        local axis=driveAxis()
+        local part=vehicle.Model.PrimaryPart
+        if (part.Position-origin):Dot(axis)<200 then return end
+        local side=axis:Cross(Vector3.new(0,1,0))
+        local lateral=(part.Position-origin):Dot(side)
+        -- Preserve the current mine lane while crossing its entrance. Splits
+        -- deep mine -> surface -> factory into bounded navmesh requests.
+        return floorAt(origin+side*lateral-axis*24,vehicle,20,100)
+    end
+
+    local function deliveryStep(vehicle,valid)
+        local job=L.delivery
+        if not job or job.vehicle~=vehicle then return false,"Delivery vehicle changed; cargo retained" end
+        if job.phase=="Return" then
+            L.phase="Returning to mine"
+            state.status="Legit: full batch delivered; returning to mining area"
+            if job.via and not job.returnVia then
+                if not driveTo(vehicle,job.via,valid) then return false,"Mine entrance return route blocked" end
+                if not valid() then return false,"Cancelled" end
+                job.returnVia=true
+            end
+            if not job.returnPoint or driveTo(vehicle,job.returnPoint,valid) then
+                if not valid() then return false,"Cancelled" end
+                L.delivery=nil
+                L.deliveries+=1
+                return true
+            end
+            return false,"Mine return route blocked"
+        end
+        local prompt=unloaderPrompt()
+        local cf=prompt and pointOf(prompt.Parent)
+        if not cf then return false,"Own unloader unavailable" end
+        L.phase="Delivering full load"
+        state.status="Legit: backpack and vehicle full; driving to own unloader"
+        if job.phase=="Outbound" then
+            if not job.via then job.via=tripVia(vehicle) end
+            if job.via and not job.outboundVia then
+                if not driveTo(vehicle,job.via,valid) then return false,"Mine exit route blocked" end
+                if not valid() then return false,"Cancelled" end
+                job.outboundVia=true
+            end
+            local part=vehicle.Model.PrimaryPart
+            if flat(part.Position-cf.Position).Magnitude>23 then
+                local goals={}
+                local _,size=vehicle.Model:GetBoundingBox()
+                local offset=math.max(14,size.X/2+size.Z/2+6)
+                for i=0,7 do
+                    local a=i*math.pi/4
+                    local goal=floorAt(cf.Position+Vector3.new(math.cos(a)*offset,0,math.sin(a)*offset),vehicle,8,60)
+                    if goal then goals[#goals+1]=goal end
+                end
+                table.sort(goals,function(a,b) return (a-part.Position).Magnitude<(b-part.Position).Magnitude end)
+                local parked=false
+                for i=1,math.min(3,#goals) do
+                    if not valid() then return false,"Cancelled" end
+                    if driveTo(vehicle,goals[i],valid) then parked=true break end
+                    if L.computing then break end
+                end
+                if not parked then return false,"Unloader driving route blocked" end
+            end
+            if not valid() then return false,"Cancelled" end
+            job.phase="Shuttle"
+        end
+        L.phase="Unloading full batch"
+        state.status="Legit: unloading batch at own factory"
+        if not exitVehicle(valid) then return false,"Cannot exit vehicle" end
+        local count,capacity=cargoStatus()
+        local vc,vmax=vehicleCargoStatus()
+        if not count or not vc then return false,"Cargo state unavailable" end
+        -- Exactly one shuttle per scheduler step; job survives a failed walk,
+        -- Stop/off-on and character respawn without requiring full cargo again.
+        if count>0 then
+            local ok,why=unloadBackpackHere(vehicle,valid)
+            if not ok then return false,why end
+        end
+        if not valid() then return false,"Cancelled" end
+        vc=vehicleCargoStatus()
+        if vc==nil then return false,"Vehicle cargo state unavailable" end
+        if vc>0 then return transfer(vehicle,"Take Items",valid) end
+        count=cargoStatus()
+        if count==0 and valid() then
+            job.phase="Return"
+            L.lastResult="Full batch unloaded; returning to mine"
+            return true
+        end
+        return false,"Waiting for empty cargo confirmation"
+    end
+    L.DeliveryStep=deliveryStep
+    -- Kept as a diagnostics entry point, with the same full-load gate.
+    function L.Unload(vehicle,valid)
+        local count,capacity=cargoStatus()
+        local vc,vmax=vehicleCargoStatus()
+        if L.CargoPlan(count,capacity,vc,vmax,L.delivery)~="Deliver" then return false,"Both capacities must be full" end
+        if not L.delivery then
+            L.delivery={vehicle=vehicle,phase="Outbound",
+                via=tripVia(vehicle),
+                returnPoint=floorAt(vehicle.Model.PrimaryPart.Position,vehicle,0,35)}
+        end
+        return deliveryStep(vehicle,valid)
+    end
+    L.RoofAttempt=roofAttempt
+
+    local function ensureVehicle(valid)
+        local vehicle=getOwnedVehicle()
+        if currentVehicle(vehicle) then return vehicle end
+        if L.delivery then
+            state.status="Legit: delivery vehicle unavailable; waiting to preserve its cargo"
+            return
+        end
+        if not valid() or os.clock()<(L.nextSpawn or 0) then return end
+        L.nextSpawn=os.clock()+10
+        -- Only spawn an already owned vehicle; never buy or replace a live car.
+        local data=require(RS.Controllers.PlayerDataController).LocalPlayerData
+        local definitions=require(RS.Definitions.VehicleDefinitions)
+        local definition
+        for id,owned in pairs(data.OwnedVehicles or {}) do
+            local d=owned and definitions[id]
+            if d and (not definition or (tonumber(d.Cost) or 0)>(tonumber(definition.Cost) or 0)
+                or (d.Cost==definition.Cost and tostring(d.Id)<tostring(definition.Id))) then definition=d end
+        end
+        if not definition then state.status="Legit: no owned vehicle available" return end
+        local grid=require(RS.Packages.Factory.FactoryGrid).ForPlayer(lp)
+        local spawner
+        for _,slot in pairs(grid:GetAllSlots()) do
+            if slot.Type=="VehicleSpawner" and slot.Owner==lp and not slot.Destroyed then spawner=slot break end
+        end
+        if not spawner then state.status="Legit: own vehicle spawner unavailable" return end
+        if not valid() or getOwnedVehicle() then return getOwnedVehicle() end
+        state.status="Legit: spawning owned "..tostring(definition.Name or definition.Id)
+        VehicleController:CreateVehicleAtSpawner(definition,spawner.Position)
+        local deadline=os.clock()+6
+        while valid() and os.clock()<deadline do
+            vehicle=getOwnedVehicle()
+            if currentVehicle(vehicle) then return vehicle end
+            task.wait(0.1)
+        end
+    end
+    L.EnsureVehicle=ensureVehicle
+
+    function L.Step()
+        if not L.enabled or L.working or not alive() then return end
+        if L.computing then state.status="Legit: waiting for previous path computation" return end
+        if state.pendingAction and not state.pendingAction.done then state.status="Legit: waiting for previous server response" return end
+        if os.clock()<(L.nextWork or 0) then return end
+        local char,root,h=characterRoot()
+        local terrain=MineTerrain.GetInstance()
+        if not root or not terrain then state.status="Legit: waiting for character/terrain" return end
+        local token=state.cancelVersion
+        local function sessionValid()
+            return alive() and L.enabled and token==state.cancelVersion and lp.Character==char
+                and root.Parent~=nil and h.Health>0 and MineTerrain.GetInstance()==terrain
+        end
+        L.working=true
+        local ok,err=pcall(function()
+            local vehicle=ensureVehicle(sessionValid)
+            if not sessionValid() then return end
+            if not currentVehicle(vehicle) then
+                state.status="Legit: waiting for owned vehicle/spawner"
+                L.nextWork=os.clock()+2
+                return
+            end
+            local function valid() return sessionValid() and currentVehicle(vehicle)~=nil end
+            local strength=pickaxeStrength()
+            local context=L.context
+            if not context or context.terrain~=terrain or context.vehicle~=vehicle or context.strength~=strength
+                or context.char~=char then
+                L.ClearSkipped()
+                L.context={terrain=terrain,vehicle=vehicle,strength=strength,char=char}
+                if L.delivery and L.delivery.vehicle~=vehicle then L.delivery=nil end
+            end
+            local count,capacity=cargoStatus()
+            local vc,vmax=vehicleCargoStatus()
+            local plan=L.CargoPlan(count,capacity,vc,vmax,L.delivery)
+            if plan=="Unknown" then
+                L.phase="Waiting for cargo"
+                state.status="Legit: waiting for replicated backpack and vehicle capacity"
+                L.nextWork=os.clock()+0.5
+                return
+            end
+            if plan=="Load vehicle" then
+                L.phase="Loading vehicle"
+                state.status="Legit: full backpack -> vehicle cargo"
+                local loaded,why=transfer(vehicle,"Add Items",valid)
+                if not loaded and valid() then state.status="Legit: "..tostring(why) L.nextWork=os.clock()+2 end
+                return
+            end
+            if plan=="Deliver" or plan=="Return" then
+                if not L.delivery then
+                    L.delivery={vehicle=vehicle,phase="Outbound",
+                        via=tripVia(vehicle),
+                        returnPoint=floorAt(vehicle.Model.PrimaryPart.Position,vehicle,0,35)}
+                end
+                local delivered,why=deliveryStep(vehicle,valid)
+                if not delivered and valid() then state.status="Legit: "..tostring(why).."; retrying" L.nextWork=os.clock()+3 end
+                return
+            end
+            L.phase="Searching"
+            local t=L.Select(terrain,root,valid)
+            local access=L.accessTarget
+            if access and sameCell(terrain,access) and not L.IsSkipped(access)
+                and (root.Position-access.world).Magnitude<=L.cfg.Radius and (not t or access.value>=t.value) then
+                access.distance=(root.Position-access.world).Magnitude
+                t=access
+            else L.accessTarget=nil end
+            if not valid() then return end
+            if not t then
+                L.target=nil
+                state.status="Legit: no affordable, unskipped ore in loaded search radius"
+                if terrain._MineOrigin and os.clock()>=(L.nextExplore or 0) then
+                    local origin=worldAt(terrain._MineOrigin)
+                    if flat(root.Position-origin).Magnitude>250 then
+                        L.phase="Travelling to mine"
+                        state.status="Legit: driving to the mine to load ore"
+                        local goal=floorAt(origin,vehicle,16,80)
+                        if goal then driveTo(vehicle,goal,valid) end
+                    end
+                    L.nextExplore=os.clock()+10
+                end
+                L.nextWork=os.clock()+0.5
+                return
+            end
+            L.target=t
+            state.currentOre,state.targetPrice,state.targetDistance=t.id,t.value,t.distance
+            -- Stay on foot for a local cluster. No seat round-trip after each
+            -- confirmed ore; the car moves only for travel or a full batch.
+            local part=vehicle.Model.PrimaryPart
+            local nearby=t.distance<=L.cfg.WalkRadius and (flat(part.Position-t.world).Magnitude<=L.cfg.WalkRadius+20
+                or (L.range and visible(t,root,vehicle,L.range)))
+            if not nearby then
+                L.phase="Driving to "..t.id
+                local parked=false
+                for i,goal in ipairs(parking(t,vehicle)) do
+                    if not valid() then return end
+                    if i>3 then break end
+                    state.status="Legit: driving to "..t.id
+                    if driveTo(vehicle,goal,valid) then parked=true break end
+                    if L.computing then break end
+                end
+                if not valid() or not sameCell(terrain,t) then return end
+                if not parked then
+                    if L.computing then state.status="Legit: waiting for path computation"
+                    elseif not L.cfg.DigAccess or t.distance>600 then L.Skip(t,false,"No vehicle route") return
+                    else state.status="Legit: vehicle route blocked; digging access on foot" end
+                    if L.computing then return end
+                end
+            end
+            if not exitVehicle(valid) or not valid() then return end
+            local client=pickaxeClient()
+            if not valid() then return end
+            if not client then state.status="Legit: equip a pickaxe" return end
+            L.range=tonumber(client.Tool.Definition.Stats.Range) or 12
+            local mined,why=groundAttempt(t,terrain,vehicle,valid)
+            if not valid() or mined or not sameCell(terrain,t) then return end
+            if why=="Higher-priced ore available" then return end
+            if why~="Pickaxe unavailable" and L.cfg.DigAccess then
+                mined,why=accessAttempt(t,terrain,vehicle,valid)
+                if not valid() or mined or not sameCell(terrain,t) then return end
+                if why=="Higher-priced ore available" then return end
+                if why=="Access progress" or why=="Backpack full" or why=="Cargo state unavailable" then
+                    L.accessTarget=t
+                    return
+                end
+            end
+            if not mined and why~="Pickaxe unavailable" and L.cfg.TryVehicle then
+                mined,why=roofAttempt(t,terrain,vehicle,valid)
+            end
+            if not valid() then return end
+            if why=="Higher-priced ore available" then return end
+            if not mined and sameCell(terrain,t) and why~="Pickaxe unavailable" then
+                L.Skip(t,true,why or "Ore unreachable")
+            end
+            L.phase="Searching"
+        end)
+        L.Release()
+        L.working=false
+        if not ok and sessionValid() then
+            state.status="Legit retry: "..tostring(err)
+            L.nextWork=os.clock()+2
+        end
+    end
+end
+
+
+----------------------------------------------------------------
 -- GUI
 ----------------------------------------------------------------
 
@@ -2350,6 +3451,7 @@ state.perfLabel = statusSection:Label("Mined: 0")
 local mining = main:Section("Mining")
 state.mineToggle = mining:Toggle("Automine",function(on)
     if on and not state.uiReady then return end
+    if on then state.Legit.SetEnabled(false) end
     state.running=on
     invalidateMining()
     if not on then cancelAction() end
@@ -2357,6 +3459,7 @@ end,false,Enum.KeyCode.P)
 mining:Label("Loaded terrain + PlacedOre: highest price first; new expensive ore interrupts mining.")
 mining:Label("Server-confirmed mining; blocked targets are skipped temporarily.")
 mining:Button("Stop all automation",function()
+    state.Legit.SetEnabled(false)
     state.running=false
     state.cfg.AutoSell=false
     state.cfg.AutoDriveForward=false
@@ -2375,12 +3478,14 @@ end)
 local selling = main:Section("Unloading")
 state.autoSellToggle=selling:Toggle("Autosell (backpack + vehicle)",function(on)
     if on and not state.uiReady then return end
+    if on then state.Legit.SetEnabled(false) end
     state.cfg.AutoSell=on
 end,false)
 selling:Slider("Unload backpack at (%)",25,100,state.cfg.SellPercent,function(v) state.cfg.SellPercent=v end,5)
 selling:Button("Sell backpack now",function() state.manualSell="Backpack" end)
 state.autoDriveToggle=selling:Toggle("Auto drive forward",function(on)
     if on and not state.uiReady then return end
+    if on then state.Legit.SetEnabled(false) end
     state.cfg.AutoDriveForward=on
     state.cancelVersion+=1
     invalidateMining()
@@ -2407,11 +3512,40 @@ explosiveSection:Toggle("Show explosive scan area",function(on)
 end,true)
 explosiveSection:Label("The orange box shows the exact scan area, including voxel overlap.")
 state.explosionCooldownToggle = explosiveSection:Toggle("Cooldown bypass (Humanoid reset)",function(on)
+    if on and state.Legit.enabled then
+        if state.explosionCooldownToggle then state.explosionCooldownToggle:Set(false) end
+        notify("Disable Legit before enabling reset bypass")
+        return
+    end
     state.SetExplosionCooldownBypass(on)
 end,false)
 explosiveSection:Label("At 0 charges: reset, hold camera, return after respawn. Also works with Auto drive forward.")
 explosiveSection:Label("Returns to the driver seat if reset started there. Disables itself if charges stay empty.")
 state.explosionResetLabel = explosiveSection:Label("Reset bypass: off")
+
+local legitFolder=win:Folder("Legit")
+local legitSection=legitFolder:Section("Complete mining cycle")
+state.legitToggle=legitSection:Toggle("Legit automine",state.Legit.SetEnabled,false)
+legitSection:Slider("Search radius (studs)",100,3000,state.Legit.cfg.Radius,function(v)
+    state.Legit.cfg.Radius=v
+    state.cancelVersion+=1
+    state.Legit.Release()
+end,25)
+legitSection:Toggle("Try standing on vehicle",function(on) state.Legit.cfg.TryVehicle=on end,true)
+legitSection:Toggle("Dig stone access to valuable ore",function(on) state.Legit.cfg.DigAccess=on end,true)
+legitSection:Label("Full-load delivery is automatic. Unknown capacity waits; partial loads stay in the mine.")
+local legitSkip=legitFolder:Section("Unreachable ore")
+legitSkip:Slider("Skip duration (seconds)",15,300,state.Legit.cfg.SkipSeconds,function(v)
+    state.Legit.cfg.SkipSeconds=v
+end,15)
+legitSkip:Slider("Skip nearby same ore (studs)",0,60,state.Legit.cfg.ClusterRadius,function(v)
+    state.Legit.cfg.ClusterRadius=v
+end,4)
+legitSkip:Label("After reach failure, nearby same ore at the same height or higher is skipped temporarily.")
+legitSkip:Button("Clear skipped targets",state.Legit.ClearSkipped)
+legitSkip:Button("Stop Legit",function() state.Legit.SetEnabled(false) end)
+state.legitStatus=legitSkip:Label("Legit: Off")
+state.legitResult=legitSkip:Label("Confirmed: 0 | Skipped: 0")
 
 ----------------------------------------------------------------
 -- TELEPORT
@@ -2469,6 +3603,7 @@ local function resolveTeleport(name)
 end
 
 local function teleportToCF(cf, reason)
+    if state.Legit.enabled then state.Legit.SetEnabled(false) end
     if not cf then notify(reason or "Location not found") return end
     if state.isDriving() then notify("Exit the vehicle first") return end
     local _, root = characterRoot()
@@ -2503,19 +3638,28 @@ local movSection = playerFolder:Section("Movement & Controls")
 
 state.noclipToggle=movSection:Toggle("Noclip",function(on)
     if on and not state.uiReady then return end
+    if on and state.Legit.enabled then state.noclipToggle:Set(false) return end
     state.SetNoclip(on)
 end,false)
 
-movSection:Checkbox("Ctrl + Click Teleport", function(on) state.ctrlClickTP = on end, false)
-movSection:Checkbox("Ctrl + Delete (delete object)", function(on) state.ctrlDelete = on end, false)
+state.ctrlClickToggle=movSection:Checkbox("Ctrl + Click Teleport", function(on)
+    state.ctrlClickTP = on and not state.Legit.enabled
+    if on and state.Legit.enabled and state.ctrlClickToggle then state.ctrlClickToggle:Set(false) end
+end, false)
+state.ctrlDeleteToggle=movSection:Checkbox("Ctrl + Delete (delete object)", function(on)
+    state.ctrlDelete = on and not state.Legit.enabled
+    if on and state.Legit.enabled and state.ctrlDeleteToggle then state.ctrlDeleteToggle:Set(false) end
+end, false)
 
 movSection:Slider("Walk Speed", 16, 500, state.walkSpeed, function(v)
+    if state.Legit.enabled then notify("Disable Legit before changing movement stats") return end
     state.walkSpeed = v
     local _, _, h = characterRoot()
     if h then h.WalkSpeed = v end
 end, 1)
 
 movSection:Slider("Jump Height", 50, 500, state.jumpHeight, function(v)
+    if state.Legit.enabled then notify("Disable Legit before changing movement stats") return end
     state.jumpHeight = v
     local _, _, h = characterRoot()
     if h then h.JumpPower = v end
@@ -2523,6 +3667,7 @@ end, 1)
 
 local flySection = playerFolder:Section("Flight")
 state.flyToggle = flySection:Toggle("Fly", function(on)
+    if on and state.Legit.enabled then state.flyToggle:Set(false) return end
     state.flyEnabled = on
     if on then resetFlyCoordinate() end
 end, false, Enum.KeyCode.X)
@@ -2544,6 +3689,7 @@ hopSection:Checkbox("Try to requeue script after teleport", function(on) state.c
 
 hopSection:Button("Server Hop (leave & join other)", function()
     if state.hopping then return end
+    state.Legit.SetEnabled(false)
     notify("Server hop requested…")
     state.running = false
     if state.mineToggle then pcall(function() state.mineToggle:Set(false) end) end
@@ -2558,6 +3704,7 @@ hopSection:Button("Server Hop (leave & join other)", function()
 end)
 
 hopSection:Button("Rejoin current server", function()
+    state.Legit.SetEnabled(false)
     notify("Rejoining current server…")
     state.cfg.AutoDriveForward = false
     releaseAutoDrive()
@@ -2586,6 +3733,9 @@ help:Button("Unload script",state.Stop)
 ----------------------------------------------------------------
 
 table.insert(state.connections, lp.CharacterRemoving:Connect(function()
+    state.Legit.Release()
+    state.Legit.target=nil
+    state.Legit.ClearSkipped()
     restoreNoclip()
     releaseAutoDrive()
     state.cancelVersion += 1
@@ -2608,11 +3758,12 @@ end
 state.mineToggle:Set(false)
 state.autoSellToggle:Set(false)
 state.autoDriveToggle:Set(false)
+state.legitToggle:Set(false)
 state.noclipToggle:Set(false)
 state.uiReady=true
 
 table.insert(state.connections,lp.Idled:Connect(function()
-    if not alive() or not (state.running or state.cfg.AutoSell or state.cfg.AutoDriveForward) then return end
+    if not alive() or not (state.running or state.cfg.AutoSell or state.cfg.AutoDriveForward or state.Legit.enabled) then return end
     local ok,err=pcall(function()
         local vu=game:GetService("VirtualUser")
         vu:CaptureController()
@@ -2637,6 +3788,11 @@ task.spawn(function()
     while alive() do
         local ok, err = pcall(function()
             if state.explosionReset then return end
+            if state.Legit.enabled then
+                state.manualSell=false
+                state.Legit.Step()
+                return
+            end
             local now = os.clock()
             local count, capacity = cargoStatus()
             local vCount, vCapacity = vehicleCargoStatus()
@@ -2661,6 +3817,7 @@ task.spawn(function()
         end)
         if not ok then
             cancelAction()
+            state.Legit.Release()
             state.driveClearUntil=0
             state.busy,state.selling=false,false
             state.nextSell,state.nextVehicleSell=os.clock()+3,os.clock()+3
@@ -2675,6 +3832,11 @@ task.spawn(function()
             local count,capacity=cargoStatus()
             local vc,vmax=vehicleCargoStatus()
             state.miningLabel:SetText(state.status)
+            local legit=state.Legit
+            state.legitStatus:SetText("Legit: "..legit.phase..(legit.enabled and " | "..state.status or ""))
+            state.legitResult:SetText("Confirmed: "..legit.confirmed.." | Skipped: "..legit.skipped
+                .." | Loads: "..legit.transfers.." | Deliveries: "..legit.deliveries
+                ..(legit.lastResult and " | "..legit.lastResult or ""))
             state.explosionResetLabel:SetText(state.explosionResetStatus
                 or (state.cfg.ExplosionCooldownBypass and "Reset bypass: waiting for empty charges" or "Reset bypass: off"))
             state.cargoLabel:SetText(count and ("Backpack: "..count.." / "..capacity) or "Backpack: unavailable")
@@ -2692,6 +3854,10 @@ function state.Diagnose()
     local count,capacity=cargoStatus()
     local vc,vmax=vehicleCargoStatus()
     return {status=state.status,running=state.running,busy=state.busy,selling=state.selling,
+        legit=state.Legit.enabled,legitPhase=state.Legit.phase,legitConfirmed=state.Legit.confirmed,
+        legitSkipped=state.Legit.skipped,legitLastSkip=state.Legit.lastSkip,legitResult=state.Legit.lastResult,
+        legitTransfers=state.Legit.transfers,legitDeliveries=state.Legit.deliveries,
+        legitValue=state.Legit.confirmedValue,legitDelivery=state.Legit.delivery and state.Legit.delivery.phase,
         pending=state.pendingAction~=nil,backpack=count,capacity=capacity,vehicleCargo=vc,
         mineRejected=state.mineRejected or 0,mineSkipped=state.mineSkipped or 0,
         accessBlocks=state.accessBlocks or 0,
@@ -2706,4 +3872,4 @@ function state.Diagnose()
         driveDrillZoneTarget=state.driveDrillZoneTarget,driveLaneError=state.driveLaneError,driveLastCleared=state.driveLastCleared,
         driveReturns=state.driveReturns,drivePickaxeMined=state.drivePickaxeMined,ore=state.currentOre,price=state.targetPrice,targetDistance=state.targetDistance,resumeError=state.lastResumeError}
 end
-notify("Ready. v37")
+notify("Ready. v39 | Full-load Legit automation")
