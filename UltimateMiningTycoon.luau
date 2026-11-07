@@ -2353,6 +2353,7 @@ do
     end
     function L.ClearSkipped()
         L.excluded,L.regions={},{}
+        L.plans={}
     end
     function L.IsSkipped(t,now)
         now=now or os.clock()
@@ -2447,7 +2448,7 @@ do
             L.ClearSkipped()
         end
         L.phase=on and "Searching" or "Off"
-        state.status=on and "Legit: looking for affordable ore" or "Legit stopped"
+        state.status=on and "Legit: looking for the highest-value mineable ore" or "Legit stopped"
         if state.legitToggle then state.legitToggle:Set(on) end
     end
 
@@ -2461,14 +2462,14 @@ do
     local function floorAt(world,vehicle,rise,drop)
         local hit=WS:Raycast(world+Vector3.new(0,rise or 12,0),
             Vector3.new(0,-(drop or 90),0),params(vehicle))
-        if hit and hit.Normal.Y>=0.65 then return hit.Position end
+        if hit and hit.Normal.Y>=0.65 and hit.Material~=Enum.Material.Water then return hit.Position end
     end
     local function route(start,goal,vehicle,valid)
         if not valid() then return nil,"Cancelled" end
         local radius,height=2,5
         if vehicle then
             local _,size=vehicle.Model:GetBoundingBox()
-            radius,height=math.max(3,size.Z/2+0.5),math.max(5,size.Y)
+            radius,height=math.max(3,math.min(size.X,size.Z)/2+0.5),math.max(5,size.Y)
         end
         local path=PathfindingService:CreatePath({AgentRadius=radius,AgentHeight=height,
             AgentCanJump=vehicle==nil,WaypointSpacing=vehicle and 8 or 4,Costs={Water=math.huge}})
@@ -2500,10 +2501,38 @@ do
         return waypoints
     end
 
+    function L.DirectWalkPoints(start,goal,vehicle,valid,followFloor)
+        local _,root,h=characterRoot()
+        if not root or not valid() then return end
+        local lift=h.HipHeight+root.Size.Y/2+0.15
+        local destination=goal+Vector3.new(0,lift,0)
+        local steps=math.max(1,math.ceil(flat(destination-start).Magnitude/4))
+        if steps>50 then return end
+        local points,previous={},start
+        for i=1,steps do
+            if not valid() then return end
+            local projected=start+(destination-start)*(i/steps)
+            local sample=Vector3.new(projected.X,previous.Y,projected.Z)
+            local floor=floorAt(sample,vehicle,2,14)
+            if not floor then return end
+            local standing=floor+Vector3.new(0,lift,0)
+            if math.abs(standing.Y-previous.Y)>2.5 then return end
+            local delta=standing-previous
+            if delta.Magnitude>0.05 and WS:Blockcast(CFrame.new(previous+Vector3.new(0,0.5,0)),
+                Vector3.new(2.4,4,2.4),delta,params(vehicle)) then return end
+            points[#points+1]={Position=floor}
+            previous=standing
+        end
+        if not followFloor and math.abs(previous.Y-destination.Y)>2.5 then return end
+        return points
+    end
+
     local function walkSegment(goal,valid,seconds,jump)
         local char,root,h=characterRoot()
         if not root or state.isDriving() or not valid() then return false,"Cannot walk now" end
-        local points,why=route(root.Position,goal,nil,valid)
+        local points=L.DirectWalkPoints(root.Position,goal,getOwnedVehicle(),valid)
+        local why
+        if not points then points,why=route(root.Position,goal,nil,valid) end
         if not points then return false,why end
         if not valid() then return false,"Cancelled" end
         local controls=require(lp.PlayerScripts.PlayerModule):GetControls()
@@ -2549,7 +2578,11 @@ do
                 if not valid() then return false,"Cancelled" end
                 local point=start+(forward*math.cos(angle)+side*math.sin(angle))*160
                 local y=start.Y+(goal.Y-start.Y)*math.min(1,160/delta.Magnitude)
-                local ground=floorAt(Vector3.new(point.X,y,point.Z),getOwnedVehicle(),24,140)
+                -- Follow the floor from the player, instead of casting from
+                -- above a guessed ramp height and selecting a cave's roof.
+                local lane=L.DirectWalkPoints(start,point,getOwnedVehicle(),valid,true)
+                local ground=lane and lane[#lane].Position
+                    or floorAt(Vector3.new(point.X,y,point.Z),getOwnedVehicle(),2,18)
                 if ground and flat(ground-goal).Magnitude<delta.Magnitude-40 then
                     local reached=walkSegment(ground,valid,math.max(seconds or 18,160/math.max(4,h.WalkSpeed)+12),jump)
                     if reached or flat(root.Position-start).Magnitude>15 then progressed=true break end
@@ -2630,6 +2663,43 @@ do
         local throttle=math.abs(speed)<limit and (reverse and 0.4 or 1) or 0
         return steer,throttle,false,reverse
     end
+    function L.DirectDrivePoints(vehicle,goal,valid)
+        if not valid() then return end
+        local part=vehicle.Model.PrimaryPart
+        local _,size=vehicle.Model:GetBoundingBox()
+        local previous=floorAt(part.Position,vehicle,0,30)
+        if not previous then return end
+        local start=previous
+        local delta=flat(goal-start)
+        local steps=math.max(1,math.ceil(delta.Magnitude/8))
+        if steps>40 then return end
+        local points={}
+        for i=1,steps do
+            if not valid() then return end
+            local p=start+delta*(i/steps)
+            local floor=floorAt(Vector3.new(p.X,previous.Y,p.Z),vehicle,6,22)
+            if not floor or math.abs(floor.Y-previous.Y)>5 then return end
+            local lift=Vector3.new(0,size.Y/2+0.5,0)
+            local body=CFrame.new(previous+lift)*part.CFrame.Rotation
+            local hit=WS:Blockcast(body,Vector3.new(size.X,math.max(3,size.Y-0.5),size.Z),floor-previous,params(vehicle))
+            -- Wheels following a rounded road can make the swept bounding box
+            -- touch its support. Treat upward floor contact as support, while
+            -- still checking the cabin's centre and edges for walls/objects.
+            if hit and not (hit.Normal and hit.Normal.Y>=0.65
+                and hit.Position.Y<=math.max(previous.Y,floor.Y)+2) then return end
+            if hit then
+                local side=flat(part.CFrame.LookVector).Unit
+                for _,offset in ipairs({0,-size.Z/2,size.Z/2}) do
+                    local from=previous+side*offset+Vector3.new(0,2.5,0)
+                    if WS:Raycast(from,floor-previous,params(vehicle)) then return end
+                end
+            end
+            points[#points+1]={Position=floor}
+            previous=floor
+        end
+        if math.abs(previous.Y-goal.Y)>5 then return end
+        return points
+    end
     local function driveSegment(vehicle,goal,valid)
         if not board(vehicle,valid) then return false,"Driver seat unreachable" end
         if not valid() then return false,"Cancelled" end
@@ -2637,11 +2707,13 @@ do
         if flat(part.Position-goal).Magnitude<8 and math.abs(part.Position.Y-goal.Y)<12 then return true end
         local start=floorAt(part.Position,vehicle,0,30)
         if not start then return false,"Vehicle has no ground" end
-        local points,why
+        local points=L.DirectDrivePoints(vehicle,goal,valid)
+        local why
         local _,size=vehicle.Model:GetBoundingBox()
         -- The car itself occupies its navmesh start. Begin at a physically
         -- clear point just beyond its footprint, without changing collisions.
         for _,sign in ipairs({1,-1}) do
+            if points then break end
             if not valid() then return false,"Cancelled" end
             local offset=part.CFrame.RightVector*sign*(size.X/2+size.Z/2+3)
             local first=floorAt(part.Position+offset,vehicle,2,25)
@@ -2710,12 +2782,12 @@ do
             local progressed=false
             -- Large navmesh searches can exhaust their node budget on an open
             -- road too. Plan short, supported legs; detour left/right if needed.
-            for _,angle in ipairs({0,0.35,-0.35,0.7,-0.7}) do
+            for _,angle in ipairs({0,0.35,-0.35,0.7,-0.7,1.2,-1.2,1.5,-1.5}) do
                 if not valid() then return false,"Cancelled" end
                 local point=position+(forward*math.cos(angle)+side*math.sin(angle))*280
                 local y=position.Y+(goal.Y-position.Y)*math.min(1,280/delta.Magnitude)
-                local ground=floorAt(Vector3.new(point.X,y,point.Z),vehicle,24,140)
-                if ground and flat(ground-goal).Magnitude<delta.Magnitude-80 then
+                local ground=floorAt(Vector3.new(point.X,y,point.Z),vehicle,4,35)
+                if ground and flat(ground-goal).Magnitude<delta.Magnitude-10 then
                     local reached=driveSegment(vehicle,ground,valid)
                     if reached then progressed=true break end
                     if L.computing then return false,"Path computation pending" end
@@ -2738,14 +2810,16 @@ do
         local _,size=vehicle.Model:GetBoundingBox()
         local distance=math.max(8,size.Z/2+5)
         local points={}
+        local anchor=t.plan and t.plan.goals[1]
         for i=0,7 do
             local angle=i*math.pi/4
             for _,offset in ipairs({distance,distance+7}) do
                 -- The mine ramp rises when travelling toward its entrance.
                 -- Casting only from the car's old Y starts below uphill floor.
-                local y=math.max(base.Y,t.world.Y+4)
-                local world=Vector3.new(t.world.X,y,t.world.Z)+Vector3.new(math.cos(angle)*offset,0,math.sin(angle)*offset)
-                local floor=floorAt(world,vehicle,8,math.max(55,y-base.Y+40))
+                local y=anchor and anchor.Y or math.max(base.Y,t.world.Y+4)
+                local center=anchor or t.world
+                local world=Vector3.new(center.X,y,center.Z)+Vector3.new(math.cos(angle)*offset,0,math.sin(angle)*offset)
+                local floor=floorAt(world,vehicle,anchor and 5 or 8,anchor and 20 or math.max(55,y-base.Y+40))
                 if floor and math.abs(floor.Y-t.world.Y)<=math.max(18,L.range or 12) then points[#points+1]=floor end
             end
         end
@@ -2789,20 +2863,12 @@ do
         L.swing=client.SwingAnimTrack
         if L.swing then L.swing:Play(nil,nil,2.4) end
         local finish=os.clock()+math.max(0.05,duration)
-        local nextPriority=os.clock()+0.8
-        local preempted=false
         while ready() and os.clock()<finish do
-            if not t.isAccess and os.clock()>=nextPriority then
-                local better=L.Select(terrain,root,valid)
-                if better and better.value>(tonumber(t.def.Value) or 0)
-                    and visible(better,root,vehicle,range) then preempted=true break end
-                nextPriority=os.clock()+0.8
-            end
             state.status=("Legit: mining %s | %.1fs"):format(t.id,math.max(0,finish-os.clock()))
             task.wait(0.05)
         end
         local accepted,why=false,"Lost physical reach"
-        if not preempted and ready() then
+        if ready() then
             accepted,why=mineConfirmed(client,terrain,t.pos,function()
                 -- Replication may replace the cell with Air before the RPC
                 -- resolves. Retain physical ownership, not the old cell here.
@@ -2812,8 +2878,8 @@ do
             end)
         end
         if L.swing then L.swing:Stop() L.swing=nil end
-        if preempted then return false,"Higher-priced ore available" end
         if accepted then
+            L.plans={}
             if t.isAccess and not t.isOre then
                 state.accessBlocks=(state.accessBlocks or 0)+1
             else
@@ -2937,17 +3003,13 @@ do
         L.phase="Ground approach"
         local _,root=characterRoot()
         if visible(t,root,vehicle,L.range) then return hitOre(t,terrain,vehicle,valid) end
-        local goals={}
-        for i=0,7 do
-            local a=i*math.pi/4
-            local world=Vector3.new(t.world.X,t.world.Y+4,t.world.Z)+Vector3.new(math.cos(a)*6,0,math.sin(a)*6)
-            local floor=floorAt(world,vehicle,6,45)
-            if floor and (floor+Vector3.new(0,3,0)-t.world).Magnitude<=L.range then goals[#goals+1]=floor end
-        end
-        table.sort(goals,function(a,b) return (a-root.Position).Magnitude<(b-root.Position).Magnitude end)
+        local plan=L.Plan(t,terrain,root,vehicle,valid)
+        local goals=plan and plan.goals or {}
         for i=1,math.min(3,#goals) do
             if not valid() then return false,"Cancelled" end
-            if walk(goals[i],valid,12) then
+            local seconds=math.clamp((goals[i]-root.Position).Magnitude/math.max(4,select(3,characterRoot()).WalkSpeed)*1.5+5,8,45)
+            if walk(goals[i],valid,seconds) then
+                if plan.access and not visible(t,root,vehicle,L.range) then return false,"Dig access" end
                 local ok,why=hitOre(t,terrain,vehicle,valid)
                 if ok then return true end
                 if why=="Pickaxe unavailable" or why=="Higher-priced ore available" then return false,why end
@@ -3005,10 +3067,187 @@ do
         return false,"Ground and vehicle reach failed"
     end
 
+    -- Build once, then update only replicated cells. A swing/search must not
+    -- rebuild the mine's hundreds of thousands of air/stone cells each time.
+    function L.Ores(terrain,valid)
+        if not valid() then return {} end
+        local registry=L.registry
+        if not registry or registry.terrain~=terrain then
+            if L.oreConnection then L.oreConnection:Disconnect() L.oreConnection=nil end
+            registry={terrain=terrain,entries={},pending={},time=0}
+            L.registry=registry
+            local ok,connection=pcall(function()
+                local event=require(RS.MadComm):GetModule("MineTerrain"):GetEvent("CellsChanged")
+                return event.OnClientEvent:Connect(function(data)
+                    if not alive() or L.registry~=registry then return end
+                    -- Native Deserialize uses 14-byte changed records followed
+                    -- by 12-byte removals. Read state after that callback settles.
+                    local count=buffer.readu32(data,0)
+                    local offset=4+count*14
+                    local removed=buffer.readu32(data,offset)
+                    if removed>4096 and removed>count*8 then
+                        registry.entries,registry.pending={},{}
+                        registry.built=false
+                        registry.revision=(registry.revision or 0)+1
+                        L.epoch=(L.epoch or 0)+1
+                        L.ClearSkipped()
+                        L.target,L.accessTarget=nil,nil
+                        if L.delivery then
+                            L.delivery.returnPoint,L.delivery.via=nil,nil
+                            L.delivery.returnVia,L.delivery.outboundVia=nil,nil
+                        end
+                        state.status="Legit: mine reset; replanning from the new terrain"
+                        return
+                    end
+                    for i=0,count-1 do
+                        local offset=4+i*14
+                        local pos=Vector3int16.new(buffer.readi32(data,offset),buffer.readi32(data,offset+4),buffer.readi32(data,offset+8))
+                        registry.pending[tostring(pos)]=pos
+                    end
+                    for i=0,removed-1 do
+                        local at=offset+4+i*12
+                        local pos=Vector3int16.new(buffer.readi32(data,at),buffer.readi32(data,at+4),buffer.readi32(data,at+8))
+                        registry.pending[tostring(pos)]=pos
+                    end
+                    registry.revision=(registry.revision or 0)+1
+                end)
+            end)
+            if ok then L.oreConnection=connection table.insert(state.connections,connection) end
+        end
+        if not registry.built or (not L.oreConnection and os.clock()-registry.time>2) then
+            local entries={}
+            local store=terrain._Cells
+            if store and type(store.List)=="function" then
+                local count,slice=0,os.clock()
+                for pos,cell in pairs(store:List()) do
+                    if cell.Ore then entries[tostring(pos)]={pos=pos} end
+                    count+=1
+                    if count%2048==0 and os.clock()-slice>0.003 then
+                        task.wait() slice=os.clock()
+                        if not valid() then return {} end
+                    end
+                end
+                state.terrainCellsSeen=count
+            else
+                for _,entry in ipairs(getTerrainCells(terrain,valid)) do entries[tostring(entry.pos)]=entry end
+            end
+            if not valid() then return {} end
+            registry.entries,registry.built,registry.time=entries,true,os.clock()
+            registry.builds=(registry.builds or 0)+1
+            registry.revision=(registry.revision or 0)+1
+        end
+        for key,pos in pairs(registry.pending) do
+            local cell=terrain:Get(pos)
+            registry.entries[key]=cell and cell.Ore and {pos=pos} or nil
+            registry.pending[key]=nil
+            registry.updates=(registry.updates or 0)+1
+        end
+        return registry.entries
+    end
+
+    -- Enumerate loaded air next to real support throughout the tool's reach.
+    -- An ore behind hard rock has no feasible stand even if its own hardness
+    -- is low. Never spend a drive/path search discovering that distinction.
+    function L.Plan(t,terrain,root,vehicle,valid)
+        if not valid() then return end
+        local range=L.range or 12
+        if visible(t,root,vehicle,range) then return {goals={},direct=true} end
+        L.plans=L.plans or {}
+        local key=targetKey(t)
+        local cached=L.plans[key]
+        local revision=L.registry and L.registry.revision or 0
+        if cached and cached.revision==revision and os.clock()-cached.time<4 then return cached.plan end
+        local _,_,h=characterRoot()
+        if not h then return end
+        local lift=h.HipHeight+root.Size.Y/2+0.15
+        local goals,access,seen={},{},{}
+        local radius=math.ceil(range/4)
+        local slice=os.clock()
+        local function bodyOpen(stand,floor)
+            local low=cellAt(Vector3.new(stand.X-1.1,floor.Y+0.4,stand.Z-1.1))
+            local high=cellAt(stand+Vector3.new(1.1,2,1.1))
+            for x=low.X,high.X do for y=low.Y,high.Y do for z=low.Z,high.Z do
+                local c=terrain:Get(Vector3int16.new(x,y,z))
+                if not c or c.Block~="Air" or c.Ore then return false end
+            end end end
+            return true
+        end
+        for x=-radius,radius do
+            if os.clock()-slice>0.004 then task.wait() slice=os.clock() end
+            if not valid() then return end
+            for z=-radius,radius do for y=-radius,radius do
+                local pos=Vector3int16.new(t.pos.X+x,t.pos.Y+y,t.pos.Z+z)
+                local c=terrain:Get(pos)
+                if not c or c.Block~="Air" or c.Ore then continue end
+                local below=terrain:Get(Vector3int16.new(pos.X,pos.Y-1,pos.Z))
+                if not below or (below.Block=="Air" and not below.Ore) then continue end
+                local base=worldAt(pos)
+                if (base-t.world).Magnitude>range+3 then continue end
+                local floor=floorAt(base,vehicle,0,7)
+                if not floor then continue end
+                local stand=floor+Vector3.new(0,lift,0)
+                if (stand-t.world).Magnitude>range-0.5 or not bodyOpen(stand,floor) then continue end
+                local floorKey=tostring(cellAt(floor+Vector3.new(0,0.5,0)))
+                if seen[floorKey] then continue end
+                seen[floorKey]=true
+                if visible(t,{Position=stand},vehicle,range-0.5) then
+                    goals[#goals+1]=floor
+                elseif L.cfg.DigAccess then
+                    local delta=t.world-stand
+                    local hit=WS:Raycast(stand,delta.Unit*(delta.Magnitude+2),params(vehicle,true))
+                    if hit and hit.Instance==WS.Terrain then
+                        local block=L.AccessBlock(terrain,cellAt(hit.Position-hit.Normal*0.1),{Position=stand},range)
+                        if block and block.pos~=t.pos and block.world.Y>floor.Y+0.5
+                            and (block.world-t.world).Magnitude<=12
+                            and visible(block,{Position=stand},vehicle,range) then access[#access+1]=floor end
+                    end
+                end
+            end end
+        end
+        -- Immediately after a mine reset, the exterior of the entrance is
+        -- real walkable ground but is intentionally absent from MineTerrain.
+        -- Approach that front face and dig a short, tool-compatible entrance;
+        -- movement still has to pass native path/body checks before any hit.
+        if #goals==0 and #access==0 and L.cfg.DigAccess and terrain._MineOrigin then
+            local origin=worldAt(terrain._MineOrigin)
+            local axis=flat(driveAxis()).Unit
+            local depth=(t.world-origin):Dot(axis)
+            local playerDepth=(root.Position-origin):Dot(axis)
+            if depth>=0 and depth<=range+8 and playerDepth<20 then
+                local side=Vector3.new(-axis.Z,0,axis.X)
+                local center=t.world-axis*(depth+5)
+                for _,offset in ipairs({0,4,-4}) do
+                    if not valid() then return end
+                    local p=center+side*offset
+                    local floor=floorAt(Vector3.new(p.X,root.Position.Y,p.Z),vehicle,2,14)
+                    if not floor then continue end
+                    local stand=floor+Vector3.new(0,lift,0)
+                    local delta=t.world-stand
+                    if delta.Magnitude>range+8 then continue end
+                    if visible(t,{Position=stand},vehicle,range-0.5) then goals[#goals+1]=floor
+                    else
+                        local hit=WS:Raycast(stand,delta.Unit*math.min(delta.Magnitude+2,range),params(vehicle,true))
+                        local block=hit and hit.Instance==WS.Terrain
+                            and L.AccessBlock(terrain,cellAt(hit.Position-hit.Normal*0.1),{Position=stand},range)
+                        if block and block.world.Y>floor.Y+0.5 and visible(block,{Position=stand},vehicle,range) then
+                            access[#access+1]=floor
+                        end
+                    end
+                end
+            end
+        end
+        local function closest(a,b) return (a-root.Position).Magnitude<(b-root.Position).Magnitude end
+        table.sort(goals,closest) table.sort(access,closest)
+        local plan=#goals>0 and {goals=goals} or (#access>0 and {goals=access,access=true} or nil)
+        L.plans[key]={time=os.clock(),revision=revision,plan=plan}
+        return plan
+    end
+
     function L.Select(terrain,root,valid)
+        local started=os.clock()
         local strength,speed=pickaxeStrength(),MiningUtils.GetPlayerPickaxeSpeedClient()
-        local best
-        for _,entry in ipairs(getTerrainCells(terrain,valid)) do
+        local candidates={}
+        for _,entry in pairs(L.Ores(terrain,valid)) do
             if not valid() then return end
             -- Unknown/generated cells are not exposed physical mining targets.
             local cell=terrain:Get(entry.pos)
@@ -3021,14 +3260,22 @@ do
                 local t={pos=entry.pos,world=world,id=id,def=def,value=tonumber(def.Value) or 0,
                     distance=(root.Position-world).Magnitude}
                 if duration and duration<999 and t.distance<=L.cfg.Radius and not L.IsSkipped(t) then
-                    if not best or t.value>best.value or (t.value==best.value
-                        and (t.distance<best.distance or (t.distance==best.distance and targetKey(t)<targetKey(best)))) then
-                        best=t
-                    end
+                    candidates[#candidates+1]=t
                 end
             end
         end
-        return best
+        table.sort(candidates,function(a,b)
+            if a.value~=b.value then return a.value>b.value end
+            if a.distance~=b.distance then return a.distance<b.distance end
+            return targetKey(a)<targetKey(b)
+        end)
+        local vehicle=getOwnedVehicle()
+        for _,t in ipairs(candidates) do
+            if not valid() then return end
+            t.plan=L.Plan(t,terrain,root,vehicle,valid)
+            if t.plan then L.selectMs=(os.clock()-started)*1000 return t end
+        end
+        L.selectMs=(os.clock()-started)*1000
     end
 
     -- A trip starts only with BOTH capacities full. Once started, finish the
@@ -3038,6 +3285,12 @@ do
         if delivery then return delivery.phase=="Return" and "Return" or "Deliver" end
         if count>=capacity then return vc>=vmax and "Deliver" or "Load vehicle" end
         return "Mine"
+    end
+
+    function L.VehicleSubmerged(vehicle)
+        local part=vehicle.Model.PrimaryPart
+        local hit=WS:Raycast(part.Position+Vector3.new(0,20,0),Vector3.new(0,-35,0),params(vehicle))
+        return hit and hit.Material==Enum.Material.Water and hit.Position.Y>part.Position.Y+1 or false
     end
 
     local function approachPrompt(prompt,vehicle,valid)
@@ -3284,8 +3537,10 @@ do
         local terrain=MineTerrain.GetInstance()
         if not root or not terrain then state.status="Legit: waiting for character/terrain" return end
         local token=state.cancelVersion
+        local epoch=L.epoch
         local function sessionValid()
             return alive() and L.enabled and token==state.cancelVersion and lp.Character==char
+                and epoch==L.epoch
                 and root.Parent~=nil and h.Health>0 and MineTerrain.GetInstance()==terrain
         end
         L.working=true
@@ -3303,12 +3558,18 @@ do
             if not context or context.terrain~=terrain or context.vehicle~=vehicle or context.strength~=strength
                 or context.char~=char then
                 L.ClearSkipped()
-                L.context={terrain=terrain,vehicle=vehicle,strength=strength,char=char}
+                L.context={terrain=terrain,vehicle=vehicle,strength=strength,char=char,range=L.range}
                 if L.delivery and L.delivery.vehicle~=vehicle then L.delivery=nil end
             end
             local count,capacity=cargoStatus()
             local vc,vmax=vehicleCargoStatus()
             local plan=L.CargoPlan(count,capacity,vc,vmax,L.delivery)
+            if plan~="Mine" and plan~="Unknown" and L.VehicleSubmerged(vehicle) then
+                L.SetEnabled(false)
+                L.phase="Vehicle needs recovery"
+                state.status="Legit paused: vehicle submerged. Move it to dry ground, then enable Legit to resume the retained cargo trip."
+                return
+            end
             if plan=="Unknown" then
                 L.phase="Waiting for cargo"
                 state.status="Legit: waiting for replicated backpack and vehicle capacity"
@@ -3332,10 +3593,18 @@ do
                 if not delivered and valid() then state.status="Legit: "..tostring(why).."; retrying" L.nextWork=os.clock()+3 end
                 return
             end
+            -- Driving disables the native backpack. Cargo delivery must run
+            -- before attempting to equip a tool, including after a reload.
+            if not exitVehicle(valid) or not valid() then return end
+            local client=pickaxeClient()
+            if not valid() then return end
+            if not client then state.status="Legit: waiting for a pickaxe" L.nextWork=os.clock()+1 return end
+            L.range=tonumber(client.Tool.Definition.Stats.Range) or 12
+            if L.context.range~=L.range then L.ClearSkipped() L.context.range=L.range end
             L.phase="Searching"
             local t=L.Select(terrain,root,valid)
             local access=L.accessTarget
-            if access and sameCell(terrain,access) and not L.IsSkipped(access)
+            if access and access.def.Hardness<=strength and sameCell(terrain,access) and not L.IsSkipped(access)
                 and (root.Position-access.world).Magnitude<=L.cfg.Radius and (not t or access.value>=t.value) then
                 access.distance=(root.Position-access.world).Magnitude
                 t=access
@@ -3343,7 +3612,7 @@ do
             if not valid() then return end
             if not t then
                 L.target=nil
-                state.status="Legit: no affordable, unskipped ore in loaded search radius"
+                state.status="Legit: no reachable mineable ore in the loaded search radius"
                 if terrain._MineOrigin and os.clock()>=(L.nextExplore or 0) then
                     local origin=worldAt(terrain._MineOrigin)
                     if flat(root.Position-origin).Magnitude>250 then
@@ -3362,8 +3631,7 @@ do
             -- Stay on foot for a local cluster. No seat round-trip after each
             -- confirmed ore; the car moves only for travel or a full batch.
             local part=vehicle.Model.PrimaryPart
-            local nearby=t.distance<=L.cfg.WalkRadius and (flat(part.Position-t.world).Magnitude<=L.cfg.WalkRadius+20
-                or (L.range and visible(t,root,vehicle,L.range)))
+            local nearby=visible(t,root,vehicle,L.range) or t.distance<=L.cfg.WalkRadius
             if not nearby then
                 L.phase="Driving to "..t.id
                 local parked=false
@@ -3390,7 +3658,7 @@ do
             local mined,why=groundAttempt(t,terrain,vehicle,valid)
             if not valid() or mined or not sameCell(terrain,t) then return end
             if why=="Higher-priced ore available" then return end
-            if why~="Pickaxe unavailable" and L.cfg.DigAccess then
+            if why~="Pickaxe unavailable" and L.cfg.DigAccess and (t.world-root.Position).Magnitude<=L.range+4 then
                 mined,why=accessAttempt(t,terrain,vehicle,valid)
                 if not valid() or mined or not sameCell(terrain,t) then return end
                 if why=="Higher-priced ore available" then return end
@@ -3399,7 +3667,8 @@ do
                     return
                 end
             end
-            if not mined and why~="Pickaxe unavailable" and L.cfg.TryVehicle then
+            if not mined and why~="Pickaxe unavailable" and L.cfg.TryVehicle
+                and flat(root.Position-vehicle.Model.PrimaryPart.Position).Magnitude<20 then
                 mined,why=roofAttempt(t,terrain,vehicle,valid)
             end
             if not valid() then return end
@@ -3526,6 +3795,7 @@ state.explosionResetLabel = explosiveSection:Label("Reset bypass: off")
 local legitFolder=win:Folder("Legit")
 local legitSection=legitFolder:Section("Complete mining cycle")
 state.legitToggle=legitSection:Toggle("Legit automine",state.Legit.SetEnabled,false)
+legitSection:Label("Highest value first, within pickaxe strength and physical reach. Walk nearby; drive for longer trips.")
 legitSection:Slider("Search radius (studs)",100,3000,state.Legit.cfg.Radius,function(v)
     state.Legit.cfg.Radius=v
     state.cancelVersion+=1
@@ -3858,6 +4128,9 @@ function state.Diagnose()
         legitSkipped=state.Legit.skipped,legitLastSkip=state.Legit.lastSkip,legitResult=state.Legit.lastResult,
         legitTransfers=state.Legit.transfers,legitDeliveries=state.Legit.deliveries,
         legitValue=state.Legit.confirmedValue,legitDelivery=state.Legit.delivery and state.Legit.delivery.phase,
+        legitSelectMs=state.Legit.selectMs,
+        legitIndexBuilds=state.Legit.registry and state.Legit.registry.builds,
+        legitIndexUpdates=state.Legit.registry and state.Legit.registry.updates,
         pending=state.pendingAction~=nil,backpack=count,capacity=capacity,vehicleCargo=vc,
         mineRejected=state.mineRejected or 0,mineSkipped=state.mineSkipped or 0,
         accessBlocks=state.accessBlocks or 0,
@@ -3872,4 +4145,4 @@ function state.Diagnose()
         driveDrillZoneTarget=state.driveDrillZoneTarget,driveLaneError=state.driveLaneError,driveLastCleared=state.driveLastCleared,
         driveReturns=state.driveReturns,drivePickaxeMined=state.drivePickaxeMined,ore=state.currentOre,price=state.targetPrice,targetDistance=state.targetDistance,resumeError=state.lastResumeError}
 end
-notify("Ready. v39 | Full-load Legit automation")
+notify("Ready. v40 | Reachable ore, highest value first")
